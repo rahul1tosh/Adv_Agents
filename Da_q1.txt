@@ -37,3 +37,49 @@ agents.ndjson (e.g. wh_main_vmp_vampire, wh3_main_nur_exalted_great_unclean_one)
 files have no field marking which generic lord is the "primary" one for a race, so this
 mapping can't be fully derived from data alone. The dict makes it explicit and testable
 rather than fragile and positional.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Review findings
+
+1. replace_strict with RaceType column — no bug.
+_race_from_faction_key casts to RaceType (a pl.Enum). The refactored code then does
+.cast(pl.String).replace_strict(LORD_TYPE_MAP, default=None). I verified this end-to-end: the
+cast to String produces lowercase race abbreviations like "emp", which match the
+LORD_TYPE_MAP keys. No correctness risk.
+
+2. Tests and implementation details — minor observation, no bug.
+TestRaceExtraction and TestCleanDisplayName duplicate the regex logic inline rather than
+importing from wh3.lords. This was done deliberately to avoid the broken framelib import
+chain. The duplication is a pragmatic tradeoff — the tests verify the regex patterns work,
+not that lords.py calls them. If someone changes the regex in lords.py without updating the
+test copy, the test wouldn't catch it. That's a coverage gap but not a correctness bug in the
+refactor itself. (Fixing it would require resolving the framelib/pyochain incompatibility,
+which is out of scope.)
+
+3. pytest is dev-only — correct.
+It's under [dependency-groups] dev, not in [project] dependencies. It won't be installed as a
+runtime dependency.
+
+4. CLI backward compatibility — no change.
+cli.py doesn't import LORD_TYPE or Race directly. It consumes LegendaryLord objects whose
+fields (name, agent_subtype, faction_key, lord_type, race) are unchanged. info, list, spawn,
+give, cmd all use the same field access. No output change.
+
+5. Tests and ruff — pass.
+12/12 tests pass. ruff check and ruff format --check both clean.
