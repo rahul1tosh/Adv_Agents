@@ -1,0 +1,39 @@
+Changes made
+
+_consts.py — replaced LORD_TYPE tuple with LORD_TYPE_MAP dict
+
+- Before: A positional tuple of 25 strings that was implicitly paired with the Race enum by
+  index. Reordering either one, or adding to one without the other, would silently assign
+  wrong lord types.
+
+- After: An explicit dict[str, str] mapping race abbreviation to lord type. The key is the
+  race value (e.g. "emp"), so the mapping is self-documenting and order-independent.
+
+lords.py — replaced join-based lookup with replace_strict()
+
+- Before: Built a temporary LazyFrame from Race enum values + LORD_TYPE tuple, then joined on
+  "race". Required importing both Race and LORD_TYPE.
+
+- After: Uses pl.Expr.replace_strict(LORD_TYPE_MAP, default=None) — a simple dict lookup per
+  row. Only imports LORD_TYPE_MAP and RaceType. The Race enum import is no longer needed
+  here.
+
+tests/test_lord_loading.py — new, 12 focused tests
+
+- TestLordTypeMap (4 tests): every Race has a mapping, no stale keys, values are non-empty,
+  sizes match.
+- TestLordTypeReplace (3 tests): correct mapping, unknown race returns null, full round-trip
+  through RaceType cast.
+- TestRaceExtraction (3 tests): regex extracts race from main_, dlc_, and wh3_ faction keys.
+- TestCleanDisplayName (2 tests): prefix stripping for standard and DLC subtypes.
+
+pyproject.toml — added pytest dev dependency
+
+
+Limitation
+
+The LORD_TYPE_MAP values are still curated — 6 of 25 don't correspond to actual agent keys in
+agents.ndjson (e.g. wh_main_vmp_vampire, wh3_main_nur_exalted_great_unclean_one). The data
+files have no field marking which generic lord is the "primary" one for a race, so this
+mapping can't be fully derived from data alone. The dict makes it explicit and testable
+rather than fragile and positional.
