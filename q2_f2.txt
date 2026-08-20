@@ -1,0 +1,48 @@
+# Problem Checker Results
+
+## Guideline 1: Realistic and representative
+**Passes.**
+
+Adding metadata to validation errors for `patternProperties` is a plausible feature request for the jsonschema library. It reflects a real-world need to understand which patterns matched when debugging validation failures. The requirements are natural and consistent with the library's existing error model (e.g., `validator`, `validator_value`, `schema_path` already carry keyword-specific metadata).
+
+## Guideline 2: Requires codebase engagement
+**Passes.**
+
+Solving this problem requires the agent to:
+- Find and understand the `ValidationError` / `_Error` class in `exceptions.py` and its attribute system (including `_set()` and `_contents()`).
+- Find and modify the `patternProperties` keyword function in `_keywords.py`.
+- Understand how `validator.descend()` works and how errors propagate.
+- Ensure existing tests and the JSON Schema test suite continue to pass.
+
+This cannot be solved without exploring and modifying the existing codebase.
+
+## Guideline 3: Programmatically testable requirements
+**Passes.**
+
+All requirements are programmatically testable:
+- Requirement 1-2: Check `errors[0].matched_patterns` exists and is a list of pattern strings.
+- Requirement 3: Check that only errors from subschema validation (not other sources) have the attribute.
+- Requirement 4: Check that when multiple patterns match, all are present in `matched_patterns`.
+- Requirement 5: Run the existing test suite to verify no regressions.
+- Requirement 6-7: Validate that properties not matching any pattern or empty `patternProperties` produce errors without `matched_patterns`.
+
+The concrete test case in the problem statement demonstrates exactly how to verify the behavior programmatically.
+
+## Guideline 4: Self-contained
+**Has an issue.**
+
+The problem statement provides only one concrete test case (single matched pattern). It references several additional behaviors (requirements 4, 6, 7) but does not provide concrete test cases for them. While requirement 4 (multiple matching patterns) is described clearly enough that an agent could construct a test, the problem says "Add tests covering these cases" but only provides one case under the "Concrete Test Cases" section.
+
+More significantly, the problem does not specify what `matched_patterns` should be when accessed on a `ValidationError` that was NOT produced by `patternProperties` (e.g., a `type` error on a top-level instance). Should it be `None`? An empty list? Should the attribute not exist at all (raising `AttributeError`)? Requirement 6 says "no matched_patterns attribute needs to be added" for non-matching properties, but does not clarify the default behavior for the attribute on the `ValidationError` class in general. Since `ValidationError` is a shared class used across all keywords, the agent needs to know whether to add a default value in `_Error.__init__` (which would affect all errors) or handle it differently. This is an information gap that forces the agent to make assumptions.
+
+---
+
+## Summary
+
+The problem **does not pass** all four guidelines. Guideline 4 (self-contained) has an issue.
+
+**Recommendations to address the issue:**
+1. Specify the default value of `matched_patterns` on `ValidationError` objects not produced by `patternProperties`. For example: "ValidationError objects not produced through patternProperties validation should have `matched_patterns` default to `None`." Or alternatively: "The `matched_patterns` attribute should only exist on errors produced through patternProperties; accessing it on other errors may raise `AttributeError`."
+2. Provide concrete test cases for the other described scenarios (multiple matching patterns, no matching patterns, empty patternProperties) under the "Concrete Test Cases" section, or explicitly state that the agent should design tests for those cases based on the requirement descriptions.
+
+Please review this feedback and iterate on the problem statement to address the issues if you think they are valid.
