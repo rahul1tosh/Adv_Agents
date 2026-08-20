@@ -1,0 +1,37 @@
+# Problem Checker Evaluation
+
+## Guideline 1: Realistic and representative
+**PASSES**
+
+The problem asks for enhanced error reporting on the `patternProperties` keyword by recording which patterns matched a property key. This is a realistic feature request — surfacing which regex patterns matched is useful for debugging in data pipelines and API validation. The codebase has a `patternProperties` validator in `_keywords.py` and the `ValidationError` class already supports a `context` field for nested errors, so the request is logically consistent with the existing architecture.
+
+## Guideline 2: Requires codebase engagement
+**PASSES**
+
+Solving this requires understanding the existing `patternProperties` implementation in `jsonschema/_keywords.py`, the `ValidationError` structure in `jsonschema/exceptions.py` (particularly the `context` field and path calculation), how `validator.descend()` works, and how the existing test suite is structured. The agent must modify existing code and write tests that integrate with the project's test infrastructure.
+
+## Guideline 3: Programmatically testable requirements
+**HAS AN ISSUE**
+
+Most requirements are testable, but there are ambiguities about *where* and *how* the matched pattern information should be stored on the error object:
+
+- "Record which patterns matched in the error context" — does "context" mean the existing `.context` list field on `ValidationError`, a new attribute, or something else? The problem does not specify the mechanism (e.g., a new field like `matched_patterns` on the error, or metadata attached to context sub-errors).
+- "Distinguish between pattern validation failure vs. schema validation failure" — this is vague. It's unclear what the expected observable behavior is. What should the error look like for each case? Without specifying the concrete output or attribute, this is not straightforwardly testable.
+
+**Suggestion:** Specify exactly where matched pattern information should be stored (e.g., a new `matched_patterns` attribute on `ValidationError`, or a specific structure in the `.context` list). Similarly, clarify what "distinguish between pattern validation failure vs. schema validation failure" means in terms of error attributes or structure.
+
+## Guideline 4: Self-contained
+**HAS AN ISSUE**
+
+The problem leaves key design decisions unspecified:
+
+- There is no specification of what attribute or data structure should hold the matched patterns. An agent must decide whether to add a new field to `ValidationError`, modify existing fields, or use some other approach — this is a design gap, not an implementation detail.
+- "Distinguish between pattern validation failure vs. schema validation failure" is stated as a requirement but not defined. The agent would need to invent what this distinction looks like.
+
+**Suggestion:** Define the concrete API surface — e.g., "Add a `matched_patterns` attribute (a list of strings) to `ValidationError` instances produced by `patternProperties` validation" — and clarify what distinguishes a "pattern validation failure" from a "schema validation failure" in terms of error output.
+
+---
+
+## Summary
+
+The problem **does not pass** all four guidelines. Guidelines 3 and 4 have issues related to underspecification of the error reporting mechanism. Please review the feedback above and iterate on the problem statement to clarify exactly how matched pattern information should be represented on error objects, and what "distinguishing pattern validation failure vs. schema validation failure" means concretely.
