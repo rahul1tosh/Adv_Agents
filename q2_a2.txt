@@ -1,0 +1,26 @@
+Summary
+I've successfully implemented child error context for unevaluatedProperties error in the jsonschema Python library. Here's what was accomplished:
+Changes Made:
+1. Modified /jsonschema/_keywords.py (lines 413-446):
+- Changed the unevaluatedProperties function to collect child errors instead of discarding them
+- Added child_errors list to accumulate validation errors for unevaluated properties
+- Pass context=child_errors when creating ValidationError for schema-based unevaluatedProperties
+- Keep context=[] when unevaluatedProperties is False
+2. Modified /jsonschema/_legacy_keywords.py (lines 420-453):
+- Applied the same changes to unevaluatedProperties_draft2019 function
+- Ensures Draft 2019-09 has the same behavior as Draft 2020-12
+3. Added Tests in /jsonschema/tests/test_validators.py:
+- Added TestUnevaluatedPropertiesContext class with 4 comprehensive tests
+- Tests verify context is added correctly for both Draft 2019-09 and Draft 2020-12
+- Tests verify false unevaluatedProperties keeps no context
+- Tests verify evaluated properties don't appear in the context
+All Requirements Met:
+✅ Applied to both Draft201909Validator and Draft202012Validator  
+✅ Only changes behavior when unevaluatedProperties is a schema object  
+✅ When unevaluatedProperties is false, keeps current behavior with context == []  
+✅ Does not change validation validity results  
+✅ Does not change existing aggregate error messages  
+✅ Does not change child error attributes  
+✅ Each child error has correct parent reference  
+✅ Evaluated properties not included in context  
+✅ All 8,079 tests pass (including official JSON Schema test suite
