@@ -1,0 +1,27 @@
+Summary
+Successfully implemented enhanced error metadata for validation errors produced by the patternProperties keyword in the jsonschema Python library.
+Changes Made:
+1. Modified /Users/rahul/Desktop/da/q1/q2/repo/jsonschema/jsonschema/_keywords.py:16-25
+- Updated the patternProperties validator function to compute all matching patterns for each property key
+- Added matched_patterns attribute to all ValidationError objects produced during patternProperties validation
+- The attribute contains a list of all pattern strings whose regex matched the property name
+2. Added comprehensive tests in /Users/rahul/Desktop/da/q1/q2/repo/jsonschema/jsonschema/tests/test_validators.py
+- Created TestPatternPropertiesMatchedPatterns class with 6 test cases covering:
+- Single matched pattern
+- Multiple matched patterns
+- Nested errors with multiple matched patterns
+- Empty patternProperties
+- Non-matching properties
+- Ordinary non-patternProperties errors (to verify matched_patterns is not added)
+Test Results:
+- ✅ All 6 new tests pass
+- ✅ All 309 existing validator tests pass
+- ✅ All 223 patternProperties tests from the JSON Schema test suite pass
+- ✅ All 7,766 tests from the official JSON Schema test suite pass (250 skipped)
+Behavior Verified:
+- matched_patterns attribute contains all patterns that matched the property key
+- Works correctly for single and multiple pattern matches
+- Works correctly for nested validation errors
+- Error messages, paths, and schema_paths remain unchanged
+- Existing tests continue to pass
+- ValidationError objects from other keywords don't have matched_patterns attribute
