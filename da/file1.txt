@@ -1,1 +1,427 @@
-hello
+Section 5: Find the mistakes
+See Step 5 in the instructions. The target trajectory is Trajectory A (gemini/brawne). It must have a correctness failure: it fails your tests or a correctness rubric. Grade it FAIL. The extra target rollout must also have a correctness failure, but not necessarily the same one. The other trajectory must be graded PASS or PARTIAL. Run the code to check this. At the end of this section, explain the extra rollout's failure and confirm that both rollouts fail. Back to top
+What kind of failure does the target have?
+See Step 5. The target must have a correctness failure. Choose the second option if it also fails a Must have dimension rubric tagged with a loss pattern that the other trajectory passes.
+
+
+Correctness failure only: the target fails my tests or a correctness rubric
+Correctness and loss-pattern failure: the target also fails a Must have loss-pattern rubric (Step 7) that the other trajectory passes
+Correctness rubrics
+Write 2 to 4, with at least one Pass if. Check what your tests do not. Step 5 explains how to write a good one.
+
+List
+Table
+Carousel
+Currently viewing item
+of 2
+Type
+
+
+Pass if
+Fail if
+Condition
+
+Write only the condition, with the input and the expected result. Do not write "pass if" or "fail if" here, and do not use files from your hidden tests/ folder. For example: parsing "Meeting at 3.30pm on April 20" with fuzzy=True returns a datetime with hour 15.
+
+
+Trajectory A
+
+
+PASS
+FAIL
+Trajectory B
+
+
+PASS
+FAIL
+Command
+
+The exact command you ran for both trajectories, and the input it used.
+
+
+Trajectory A output
+
+Paste the part of the output that shows the behavior: the returned value or the error. A test summary such as 12 passed is not enough.
+
+
+Trajectory B output
+
+The same for Trajectory B.
+
+
+Currently viewing item
+of 2
+Trajectory A correctness
+
+PASS
+PARTIAL
+FAIL
+Trajectory B correctness
+
+PASS
+PARTIAL
+FAIL
+Correctness reasoning
+Explain both grades, using your correctness standard. If a grade is not PASS, say exactly what is broken.
+
+
+Correctness failure in the extra rollout
+Explain the correctness failure in the extra target rollout that Validate deliverables names (Step 5). It does not have to be the same failure as the compared target's. Write its trial folder name and what shows the failure: the test it fails (a reward below 1 is enough), or the correctness rubric it fails with the command and output. Then say in one sentence how it compares with the compared target's failure.
+
+
+Confirm both target rollouts fail
+Check every box. If one is not true, change the task and run both jobs again (Step 5).
+
+The target's rollout in the main job has a correctness failure: it fails my tests or a correctness rubric
+The extra target rollout has a correctness failure too: it fails my tests or a correctness rubric
+I did not rerun or replace the extra rollout to get a different result. I only reran it if it stopped with an error
+Section 6: Dimension ratings
+See Step 6 in the instructions. Rate each trajectory on each dimension. Explain both ratings with evidence. Back to top
+1. Architecture, Modularity, and Trade-off Soundness
+Is the design right for what the task needs?
+
+Minor issue
+
+It works, but a better design choice was available.
+
+Major issue
+
+The code is in the wrong place, or it is a quick hack when a clean solution was possible.
+
+Trajectory A
+
+
+No issue
+Minor issue
+Major issue
+Trajectory B
+
+
+No issue
+Minor issue
+Major issue
+Why? Compare the two trajectories and give evidence. If this dimension does not matter much for your task, say so.
+
+
+2. Codebase Conventions and Utility Reuse
+Does the code follow the project's style and use the project's existing helper code?
+
+Minor issue
+
+Small style differences, or a little code that copies an existing helper.
+
+Major issue
+
+Writes again something that the repository already has.
+
+Trajectory A
+
+
+No issue
+Minor issue
+Major issue
+Trajectory B
+
+
+No issue
+Minor issue
+Major issue
+Why? Compare the two trajectories and give evidence. If this dimension does not matter much for your task, say so.
+
+
+3. Robustness, Safety, and API Stability
+Does the code handle edge cases and errors, and does existing code that uses it still work?
+
+Minor issue
+
+Misses a less important edge case. Existing behavior still works.
+
+Major issue
+
+Crashes, damages data, hides errors, or breaks existing code.
+
+Trajectory A
+
+
+No issue
+Minor issue
+Major issue
+Trajectory B
+
+
+No issue
+Minor issue
+Major issue
+Why? Compare the two trajectories and give evidence. If this dimension does not matter much for your task, say so.
+
+
+4. Instruction Following and Scope Discipline
+Does the agent do what the prompt asked, and only that?
+
+Minor issue
+
+A small change that nobody asked for, or a requirement that is only partly met.
+
+Major issue
+
+Ignores an instruction, skips part of the task, or makes large unrelated changes.
+
+Trajectory A
+
+
+No issue
+Minor issue
+Major issue
+Trajectory B
+
+
+No issue
+Minor issue
+Major issue
+Why? Compare the two trajectories and give evidence. If this dimension does not matter much for your task, say so.
+
+
+5. Planning, Research, and Tool Proficiency
+Does the agent read the right code before editing, and use its tools well?
+
+Minor issue
+
+Some unnecessary steps, but the result is not much worse.
+
+Major issue
+
+Edits code without reading it first, or repeats the same steps, and the result is worse.
+
+Trajectory A
+
+
+No issue
+Minor issue
+Major issue
+Trajectory B
+
+
+No issue
+Minor issue
+Major issue
+Why? Compare the two trajectories and give evidence. If this dimension does not matter much for your task, say so.
+
+
+6. Verification and Testing Discipline
+Does the agent run the tests for the code it changed, and react to the results?
+
+Minor issue
+
+Checks only part of the work, for example only its own new test.
+
+Major issue
+
+Does not check its work, makes tests weaker, or says it succeeded when the evidence says it did not.
+
+Trajectory A
+
+
+No issue
+Minor issue
+Major issue
+Trajectory B
+
+
+No issue
+Minor issue
+Major issue
+Why? Compare the two trajectories and give evidence. If this dimension does not matter much for your task, say so.
+
+
+7. Intermediate Communication and Risk Explanation
+While it works, does the agent explain its important decisions and risks?
+
+Minor issue
+
+Does not mention one important risk, or writes too many unneeded messages.
+
+Major issue
+
+Hides a serious problem, or makes a risky choice without saying so.
+
+Trajectory A
+
+
+No issue
+Minor issue
+Major issue
+Trajectory B
+
+
+No issue
+Minor issue
+Major issue
+Why? Compare the two trajectories and give evidence. If this dimension does not matter much for your task, say so.
+
+
+8. Final Summary and Presentation Quality
+Does the final message correctly say what changed and how it was checked?
+
+Minor issue
+
+Correct, but incomplete or hard to understand.
+
+Major issue
+
+Says things that are false, for example that failing tests passed. Or it does not mention a known problem.
+
+Trajectory A
+
+
+No issue
+Minor issue
+Major issue
+Trajectory B
+
+
+No issue
+Minor issue
+Major issue
+Why? Compare the two trajectories and give evidence. If this dimension does not matter much for your task, say so.
+
+
+Section 7: Dimension rubrics
+See Step 7 in the instructions. Write 8 to 19 rubrics, plus the fabrication rubric on Dimension 7 or 8 (Step 7). Write Pass if rubrics by default, and use Fail if only as Step 7 describes. Neither Dimensions 1-4 nor Dimensions 5-8 can have more than 65% of your rubrics. Tag each rubric with the loss pattern it checks, and tag at least one. Back to top
+Rubrics
+1
+
+Architecture, Modularity, and Trade-off Soundness
+
+5
+
+Planning, Research, and Tool Proficiency
+
+2
+
+Codebase Conventions and Utility Reuse
+
+6
+
+Verification and Testing Discipline
+
+3
+
+Robustness, Safety, and API Stability
+
+7
+
+Intermediate Communication and Risk Explanation
+
+4
+
+Instruction Following and Scope Discipline
+
+8
+
+Final Summary and Presentation Quality
+
+Also add your fabrication rubric: a Must have Fail if on Dimension 7 or 8 whose condition includes the word fabricates (Step 7).
+
+List
+Table
+Carousel
+Currently viewing item
+of 8
+Type
+
+
+Pass if
+Fail if
+Condition
+
+Write only the condition. It must be specific to this task. The fabrication rubric (Step 7) is the exception: its suggested wording is fine as it is. For example: the agent read src/common/retries.py before it wrote retry code.
+
+
+Dimension
+
+
+1
+2
+3
+4
+5
+6
+7
+8
+Source
+
+
+Explicit prompt
+Repository evidence
+Common engineering knowledge
+Importance
+
+
+Must have
+Nice to have
+Loss pattern
+
+Which loss pattern does this rubric check? See Step 7.
+
+
+None of these
+Reads the codebase, then ignores it
+Breaks explicit constraints and scope
+Happy-path-only core logic
+Weak or absent verification
+Gaming the checks
+Poor fit with the repository
+Trajectory A
+
+
+PASS
+FAIL
+Trajectory B
+
+
+PASS
+FAIL
+Evidence
+
+What shows your answers are right? Give evidence for both trajectories, for example a file and line in the diff or a step number in the trajectory. For the fabrication rubric, list each claim and whether it is supported (Step 7).
+
+
+Currently viewing item
+of 8
+Check rubric counts
+Runs the same rubric and grade checks that run when you submit.
+
+Check rubric quality
+An automatic review of your rubrics, answers and evidence, using the rules in Steps 5 and 7. Run Validate deliverables first, because this check reads your patches from there. Run it again after you change a rubric. You cannot submit until it has run on your final rubrics. It can make mistakes, and you may disagree with it.
+
+Section 8: Overall score and preference
+See Step 8 in the instructions. Back to top
+Trajectory A overall quality
+1 = cannot be used, 5 = can be used without changes.
+
+
+1
+2
+3
+4
+5
+Trajectory B overall quality
+1 = cannot be used, 5 = can be used without changes.
+
+
+1
+2
+3
+4
+5
+Pairwise preference
+If an engineer needed this work, which trajectory would they prefer?
+
+
+A is much better
+A is better
+Tie
+B is better
+B is much better
+Rationale
+Describe the most important differences, in the code and in how each agent worked. Do not repeat your scores.
