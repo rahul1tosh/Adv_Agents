@@ -1,0 +1,26 @@
+{
+    "task": {
+        "path": "hello-world-demo"
+    },
+    "trial_name": "hello-world-demo__j2muvhr",
+    "trials_dir": "jobs/lineage-demo",
+    "agent_setup_timeout_multiplier": 3.0,
+    "agent": {
+        "name": "mini-swe-agent",
+        "model_name": "anthropic/shrike",
+        "kwargs": {
+            "config": {
+                "model": {
+                    "model_kwargs": {
+                        "api_base": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/anthropic",
+                        "max_tokens": 65536
+                    }
+                }
+            }
+        },
+        "env": {
+            "ANTHROPIC_BASE_URL": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/anthropic"
+        }
+    },
+    "job_id": "a025bea4-7157-4e5d-bc0b-7498a20c4279"
+}

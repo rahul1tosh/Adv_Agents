@@ -1,0 +1,47 @@
+{
+    "job_name": "lineage-demo",
+    "agent_setup_timeout_multiplier": 3.0,
+    "n_concurrent_trials": 2,
+    "agents": [
+        {
+            "name": "mini-swe-agent",
+            "model_name": "gemini/brawne",
+            "kwargs": {
+                "config": {
+                    "model": {
+                        "model_kwargs": {
+                            "api_base": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta",
+                            "max_tokens": 65536
+                        }
+                    }
+                }
+            },
+            "env": {
+                "GEMINI_API_BASE": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta",
+                "GOOGLE_BASE_URL": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta"
+            }
+        },
+        {
+            "name": "mini-swe-agent",
+            "model_name": "anthropic/shrike",
+            "kwargs": {
+                "config": {
+                    "model": {
+                        "model_kwargs": {
+                            "api_base": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/anthropic",
+                            "max_tokens": 65536
+                        }
+                    }
+                }
+            },
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/anthropic"
+            }
+        }
+    ],
+    "tasks": [
+        {
+            "path": "hello-world-demo"
+        }
+    ]
+}

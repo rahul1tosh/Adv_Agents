@@ -1,0 +1,882 @@
+diff --git a/docs/gear_up/metadata.rst b/docs/gear_up/metadata.rst
+index 77509b4..238a7d7 100644
+--- a/docs/gear_up/metadata.rst
++++ b/docs/gear_up/metadata.rst
+@@ -107,6 +107,81 @@ Please refer to SQLAlchemy `Dialect`_ documentation for connection information i
+ 
+ 
+ 
++Primary Keys and Foreign Keys
++=============================
++
++Besides columns, a MetaDataProvider can also provide primary key and foreign keys of a table. These keys are shown
++alongside the table lineage. They are only informational and don't change the lineage result itself.
++
++:meth:`sqllineage.core.metadata_provider.MetaDataProvider.get_table_keys` returns a
++:class:`sqllineage.core.models.TableKeys` for a table. Column names are normalized the same way as
++``get_table_columns`` does, and foreign keys are sorted by (columns, referred_table). Unknown tables get empty keys,
++and this method never raises.
++
++.. autoclass:: sqllineage.core.models.TableKeys
++    :members: primary_key, foreign_keys
++
++.. autoclass:: sqllineage.core.models.ForeignKey
++    :members: columns, referred_table, referred_columns
++
++``SQLAlchemyMetaDataProvider`` reads the keys by database reflection. When the table doesn't exist, no keys are returned
++and a warning is logged. ``DummyMetaDataProvider`` takes the keys as two extra dicts, keyed by ``schema.table`` just
++like ``metadata``:
++
++.. code-block:: python
++
++    >>> from sqllineage.core.metadata.dummy import DummyMetaDataProvider
++    >>> from sqllineage.core.models import ForeignKey, Table
++    >>> from sqllineage.runner import LineageRunner
++    >>> sql = """insert into db1.report
++    ... select o.order_id, c.name
++    ... from db2.orders o join db2.customers c on o.customer_id = c.id"""
++    >>> provider = DummyMetaDataProvider(
++    ...     primary_keys={"db2.customers": ["id"], "db2.orders": ["order_id"]},
++    ...     foreign_keys={
++    ...         "db2.orders": [ForeignKey(("customer_id",), Table("db2.customers"), ("id",))]
++    ...     },
++    ... )
++    >>> runner = LineageRunner(sql, metadata_provider=provider)
++    >>> runner.print_table_lineage()
++    Statements(#): 1
++    Source Tables:
++        db2.customers [PK: id]
++        db2.orders [PK: order_id; FK: customer_id -> db2.customers(id)]
++    Target Tables:
++        db1.report
++
++    >>> runner.get_table_keys()[Table("db2.orders")]
++    TableKeys(primary_key=('order_id',), foreign_keys=(ForeignKey(columns=('customer_id',), referred_table=Table: db2.customers, referred_columns=('id',)),))
++
++The command line table-level output (``sqllineage -e ... --sqlalchemy_url=...``) shows the keys the same way. In
++``LineageRunner.to_cytoscape()``, table nodes with keys get ``primary_key`` and ``foreign_keys`` attributes. At column
++level, the columns that are part of a key also get a ``keys`` attribute, like ``["PK", "FK"]``.
++
++``LineageRunner`` looks up each table at most once, and never queries a provider that has no metadata (a provider
++whose bool value is ``False``, like the default empty ``DummyMetaDataProvider``). When no keys are known, the output
++is exactly the same as before.
++
++To provide keys from your own MetaDataProvider, override the two optional hooks below in addition to
++``_get_table_columns``. Both default to returning an empty list, so existing custom providers keep working unchanged.
++
++.. code-block:: python
++
++    from sqllineage.core.metadata_provider import MetaDataProvider
++    from sqllineage.core.models import ForeignKey, Table
++
++
++    class MyMetaDataProvider(MetaDataProvider):
++        def _get_table_columns(self, schema: str, table: str, **kwargs) -> list[str]:
++            ...
++
++        def _get_primary_key(self, schema: str, table: str) -> list[str]:
++            return ["order_id"]
++
++        def _get_foreign_keys(self, schema: str, table: str) -> list[ForeignKey]:
++            return [ForeignKey(("customer_id",), Table("db2.customers"), ("id",))]
++
++
+ .. _Dialect: https://docs.sqlalchemy.org/en/20/dialects/
+ .. _snowflake-sqlalchemy: https://github.com/snowflakedb/snowflake-sqlalchemy
+ .. _sqlalchemy-bigquery: https://github.com/googleapis/python-bigquery-sqlalchemy
+diff --git a/sqllineage/core/metadata/dummy.py b/sqllineage/core/metadata/dummy.py
+index 936b9b9..930ceda 100644
+--- a/sqllineage/core/metadata/dummy.py
++++ b/sqllineage/core/metadata/dummy.py
+@@ -1,4 +1,5 @@
+ from sqllineage.core.metadata_provider import MetaDataProvider
++from sqllineage.core.models import ForeignKey
+ 
+ 
+ class DummyMetaDataProvider(MetaDataProvider):
+@@ -6,15 +7,35 @@ class DummyMetaDataProvider(MetaDataProvider):
+     A Dummy MetaDataProvider that accept metadata as a dict
+     """
+ 
+-    def __init__(self, metadata: dict[str, list[str]] | None = None):
++    def __init__(
++        self,
++        metadata: dict[str, list[str]] | None = None,
++        primary_keys: dict[str, list[str]] | None = None,
++        foreign_keys: dict[str, list[ForeignKey]] | None = None,
++    ):
+         """
+         :param metadata: a dict with schema.table name as key and a list of unqualified column name as value
++        :param primary_keys: a dict with schema.table name as key and a list of primary key column names as value
++        :param foreign_keys: a dict with schema.table name as key and a list of
++            :class:`sqllineage.core.models.ForeignKey` as value
+         """
+         super().__init__()
+         self.metadata = metadata if metadata is not None else {}
++        self.primary_keys = primary_keys if primary_keys is not None else {}
++        self.foreign_keys = foreign_keys if foreign_keys is not None else {}
+ 
+     def _get_table_columns(self, schema: str, table: str, **kwargs) -> list[str]:
+         return self.metadata.get(f"{schema}.{table}", [])
+ 
++    def _get_primary_key(self, schema: str, table: str) -> list[str]:
++        return list(self.primary_keys.get(f"{schema}.{table}", []))
++
++    def _get_foreign_keys(self, schema: str, table: str) -> list[ForeignKey]:
++        return list(self.foreign_keys.get(f"{schema}.{table}", []))
++
+     def __bool__(self):
+-        return len(self.metadata) > 0
++        return (
++            len(self.metadata) > 0
++            or len(self.primary_keys) > 0
++            or len(self.foreign_keys) > 0
++        )
+diff --git a/sqllineage/core/metadata/sqlalchemy.py b/sqllineage/core/metadata/sqlalchemy.py
+index e41f212..617457a 100644
+--- a/sqllineage/core/metadata/sqlalchemy.py
++++ b/sqllineage/core/metadata/sqlalchemy.py
+@@ -1,13 +1,20 @@
+ import logging
+ from typing import Any
+ 
+-from sqlalchemy import MetaData, Table, create_engine
++from sqlalchemy import MetaData, Table, create_engine, inspect
+ from sqlalchemy.engine import (
+     make_url,
+ )  # note: from sqlalchemy import make_url is only possible for v2.x
+-from sqlalchemy.exc import NoSuchModuleError, NoSuchTableError, OperationalError
++from sqlalchemy.exc import (
++    NoSuchModuleError,
++    NoSuchTableError,
++    OperationalError,
++    SQLAlchemyError,
++)
+ 
+ from sqllineage.core.metadata_provider import MetaDataProvider
++from sqllineage.core.models import ForeignKey, Schema
++from sqllineage.core.models import Table as SQLLineageTable
+ from sqllineage.exceptions import MetaDataProviderException
+ 
+ logger = logging.getLogger(__name__)
+@@ -25,6 +32,8 @@ class SQLAlchemyMetaDataProvider(MetaDataProvider):
+         """
+         super().__init__()
+         self.metadata_obj = MetaData()
++        # reflected (primary key, foreign keys) per (schema, table), shared by the two key hooks
++        self._keys_cache: dict[tuple[str, str], tuple[list[str], list[ForeignKey]]] = {}
+         try:
+             if engine_kwargs is None:
+                 engine_kwargs = {}
+@@ -59,3 +68,48 @@ class SQLAlchemyMetaDataProvider(MetaDataProvider):
+                 self.engine.url,
+             )
+         return columns
++
++    def _get_primary_key(self, schema: str, table: str) -> list[str]:
++        return list(self._reflect_keys(schema, table)[0])
++
++    def _get_foreign_keys(self, schema: str, table: str) -> list[ForeignKey]:
++        return list(self._reflect_keys(schema, table)[1])
++
++    def _reflect_keys(
++        self, schema: str, table: str
++    ) -> tuple[list[str], list[ForeignKey]]:
++        if (cache_key := (schema, table)) in self._keys_cache:
++            return self._keys_cache[cache_key]
++        primary_key: list[str] = []
++        foreign_keys: list[ForeignKey] = []
++        try:
++            inspector = inspect(self.engine)
++            if not inspector.has_table(table, schema=schema):
++                raise NoSuchTableError(f"{schema}.{table}")
++            pk_constraint = inspector.get_pk_constraint(table, schema=schema) or {}
++            primary_key = list(pk_constraint.get("constrained_columns") or [])
++            for fk in inspector.get_foreign_keys(table, schema=schema):
++                if not fk.get("referred_table"):
++                    continue
++                referred_schema: str | None = fk.get("referred_schema") or schema
++                if referred_schema == Schema.unknown:
++                    referred_schema = None
++                foreign_keys.append(
++                    ForeignKey(
++                        columns=tuple(fk.get("constrained_columns") or ()),
++                        referred_table=SQLLineageTable(
++                            fk["referred_table"], Schema(referred_schema)
++                        ),
++                        referred_columns=tuple(fk.get("referred_columns") or ()),
++                    )
++                )
++        except SQLAlchemyError:
++            logger.warning(
++                "error listing keys for table %s.%s in %s, return no keys instead",
++                schema,
++                table,
++                self.engine.url,
++            )
++            primary_key, foreign_keys = [], []
++        self._keys_cache[cache_key] = (primary_key, foreign_keys)
++        return primary_key, foreign_keys
+diff --git a/sqllineage/core/metadata_provider.py b/sqllineage/core/metadata_provider.py
+index 20b0924..5cc39b4 100644
+--- a/sqllineage/core/metadata_provider.py
++++ b/sqllineage/core/metadata_provider.py
+@@ -1,6 +1,9 @@
++import logging
+ from abc import ABC, abstractmethod
+ 
+-from sqllineage.core.models import Column, Table
++from sqllineage.core.models import Column, ForeignKey, Table, TableKeys
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ class MetaDataProvider(ABC):
+@@ -43,6 +46,56 @@ class MetaDataProvider(ABC):
+     def _get_table_columns(self, schema: str, table: str, **kwargs) -> list[str]:
+         raise NotImplementedError
+ 
++    def get_table_keys(self, table: Table) -> TableKeys:
++        """
++        return primary key and foreign keys of given table.
++
++        Empty :class:`sqllineage.core.models.TableKeys` is returned for unknown tables. This method never raises.
++        """
++        schema, table_name = str(table.schema), table.raw_name
++        try:
++            primary_key = self._get_primary_key(schema, table_name)
++        except Exception:
++            logger.warning(
++                "error getting primary key for table %s, ignore it",
++                table,
++                exc_info=True,
++            )
++            primary_key = []
++        try:
++            foreign_keys = self._get_foreign_keys(schema, table_name)
++        except Exception:
++            logger.warning(
++                "error getting foreign keys for table %s, ignore it",
++                table,
++                exc_info=True,
++            )
++            foreign_keys = []
++        try:
++            return TableKeys(
++                primary_key=tuple(primary_key or ()),
++                foreign_keys=tuple(foreign_keys or ()),
++            )
++        except Exception:
++            logger.warning(
++                "invalid keys returned for table %s, ignore it", table, exc_info=True
++            )
++            return TableKeys()
++
++    def _get_primary_key(self, schema: str, table: str) -> list[str]:
++        """
++        return primary key column names of given table, empty list if unknown.
++        Override this method to provide primary key information.
++        """
++        return []
++
++    def _get_foreign_keys(self, schema: str, table: str) -> list[ForeignKey]:
++        """
++        return foreign keys of given table, empty list if unknown.
++        Override this method to provide foreign key information.
++        """
++        return []
++
+     def register_session_metadata(self, table: Table, columns: list[Column]) -> None:
+         """Register session-level metadata, like temporary table or view created."""
+         self._session_metadata[str(table)] = [c.raw_name for c in columns]
+diff --git a/sqllineage/core/models.py b/sqllineage/core/models.py
+index bc0da7b..4b95c31 100644
+--- a/sqllineage/core/models.py
++++ b/sqllineage/core/models.py
+@@ -1,4 +1,6 @@
+ import warnings
++from collections.abc import Iterable
++from dataclasses import dataclass
+ from typing import Any, NamedTuple
+ 
+ from sqllineage.config import SQLLineageConfig
+@@ -332,3 +334,92 @@ class LateralView(SubQuery):
+             column = Column(column_name)
+             column.parent = self
+             self.columns.append(column)
++
++
++def _normalize_key_columns(columns: Iterable[str]) -> tuple[str, ...]:
++    # same normalization as MetaDataProvider.get_table_columns, which goes through Column(name)
++    if isinstance(columns, str):
++        columns = (columns,)
++    return tuple(escape_identifier_name(c) for c in columns)
++
++
++@dataclass(frozen=True)
++class ForeignKey:
++    """
++    Data Class for a foreign key constraint of a table
++    """
++
++    #: constrained columns in the referencing table
++    columns: tuple[str, ...]
++    #: the referred table, as defined by :class:`Table`
++    referred_table: Table
++    #: referred columns in the referred table
++    referred_columns: tuple[str, ...]
++
++    def __post_init__(self):
++        object.__setattr__(self, "columns", _normalize_key_columns(self.columns))
++        object.__setattr__(
++            self, "referred_columns", _normalize_key_columns(self.referred_columns)
++        )
++
++    def __str__(self):
++        return (
++            f"{', '.join(self.columns)} -> "
++            f"{self.referred_table}({', '.join(self.referred_columns)})"
++        )
++
++    def sort_key(self) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
++        # sorted by (columns, referred_table), referred_columns only breaks ties
++        return self.columns, str(self.referred_table), self.referred_columns
++
++
++@dataclass(frozen=True)
++class TableKeys:
++    """
++    Data Class for primary key and foreign keys of a table
++    """
++
++    #: primary key columns, empty when unknown
++    primary_key: tuple[str, ...] = ()
++    #: foreign keys, sorted by (columns, referred_table)
++    foreign_keys: tuple[ForeignKey, ...] = ()
++
++    def __post_init__(self):
++        object.__setattr__(
++            self, "primary_key", _normalize_key_columns(self.primary_key)
++        )
++        object.__setattr__(
++            self,
++            "foreign_keys",
++            tuple(sorted(set(self.foreign_keys), key=ForeignKey.sort_key)),
++        )
++
++    def __bool__(self):
++        return bool(self.primary_key or self.foreign_keys)
++
++    def __str__(self):
++        parts = []
++        if self.primary_key:
++            parts.append(f"PK: {', '.join(self.primary_key)}")
++        if self.foreign_keys:
++            parts.extend(f"FK: {fk}" for fk in self.foreign_keys)
++        return "; ".join(parts)
++
++    @property
++    def foreign_key_columns(self) -> set[str]:
++        return {c for fk in self.foreign_keys for c in fk.columns}
++
++    def to_dict(self) -> dict[str, Any]:
++        result: dict[str, Any] = {}
++        if self.primary_key:
++            result["primary_key"] = list(self.primary_key)
++        if self.foreign_keys:
++            result["foreign_keys"] = [
++                {
++                    "columns": list(fk.columns),
++                    "referred_table": str(fk.referred_table),
++                    "referred_columns": list(fk.referred_columns),
++                }
++                for fk in self.foreign_keys
++            ]
++        return result
+diff --git a/sqllineage/runner.py b/sqllineage/runner.py
+index 22a73c1..2b0e706 100644
+--- a/sqllineage/runner.py
++++ b/sqllineage/runner.py
+@@ -9,7 +9,7 @@ from sqllineage import DEFAULT_DIALECT, SQLPARSE_DIALECT
+ from sqllineage.core.holders import SQLLineageHolder
+ from sqllineage.core.metadata.dummy import DummyMetaDataProvider
+ from sqllineage.core.metadata_provider import MetaDataProvider
+-from sqllineage.core.models import Column, Path, Table
++from sqllineage.core.models import Column, Path, Table, TableKeys
+ from sqllineage.core.parser.sqlfluff.analyzer import SqlFluffLineageAnalyzer
+ from sqllineage.core.parser.sqlparse.analyzer import SqlParseLineageAnalyzer
+ from sqllineage.drawing import draw_lineage_graph
+@@ -71,6 +71,7 @@ class LineageRunner:
+         self._dialect = dialect
+         self._metadata_provider = metadata_provider
+         self._silent_mode = silent_mode
++        self._table_keys: dict[Table, TableKeys] | None = None
+ 
+     @lazy_method
+     def __str__(self):
+@@ -78,8 +79,15 @@ class LineageRunner:
+         print out the Lineage Summary.
+         """
+         statements = self.statements()
+-        source_tables = "\n    ".join(str(t) for t in self.source_tables)
+-        target_tables = "\n    ".join(str(t) for t in self.target_tables)
++        table_keys = self.get_table_keys()
++
++        def _fmt(t: Table | Path) -> str:
++            if isinstance(t, Table) and (keys := table_keys.get(t)):
++                return f"{t} [{keys}]"
++            return str(t)
++
++        source_tables = "\n    ".join(_fmt(t) for t in self.source_tables)
++        target_tables = "\n    ".join(_fmt(t) for t in self.target_tables)
+         combined = f"""Statements(#): {len(statements)}
+ Source Tables:
+     {source_tables}
+@@ -88,7 +96,7 @@ Target Tables:
+ """
+         if self.intermediate_tables:
+             intermediate_tables = "\n    ".join(
+-                str(t) for t in self.intermediate_tables
++                _fmt(t) for t in self.intermediate_tables
+             )
+             combined += f"""Intermediate Tables:
+     {intermediate_tables}"""
+@@ -111,9 +119,81 @@ Target Tables:
+         to turn the DAG into cytoscape format.
+         """
+         if level == LineageLevel.COLUMN:
+-            return to_cytoscape(self._sql_holder.column_lineage_graph, compound=True)
++            elements = to_cytoscape(
++                self._sql_holder.column_lineage_graph, compound=True
++            )
+         else:
+-            return to_cytoscape(self._sql_holder.table_lineage_graph)
++            elements = to_cytoscape(self._sql_holder.table_lineage_graph)
++        if table_keys := self.get_table_keys():
++            # done on the generic cytoscape output so that every graph operator implementation agrees
++            self._add_keys_to_cytoscape(elements, table_keys, level)
++        return elements
++
++    @staticmethod
++    def _add_keys_to_cytoscape(
++        elements: list[dict[str, dict[str, Any]]],
++        table_keys: dict[Table, TableKeys],
++        level: str,
++    ) -> None:
++        keys_by_name = {str(t): k for t, k in table_keys.items()}
++        for element in elements:
++            data = element.get("data", {})
++            if "source" in data and "target" in data:
++                # edge
++                continue
++            node_id = data.get("id")
++            if level == LineageLevel.COLUMN:
++                if data.get("type") == "Table" and node_id in keys_by_name:
++                    data.update(keys_by_name[node_id].to_dict())
++                elif (
++                    data.get("type") == "Column"
++                    and (parent := data.get("parent")) in keys_by_name
++                    and isinstance(node_id, str)
++                    and node_id.startswith(f"{parent}.")
++                ):
++                    keys = keys_by_name[parent]
++                    column_name = node_id[len(parent) + 1 :]
++                    column_keys = []
++                    if column_name in keys.primary_key:
++                        column_keys.append("PK")
++                    if column_name in keys.foreign_key_columns:
++                        column_keys.append("FK")
++                    if column_keys:
++                        data["keys"] = column_keys
++            elif node_id in keys_by_name:
++                data.update(keys_by_name[node_id].to_dict())
++
++    @lazy_method
++    def get_table_keys(self) -> dict[Table, TableKeys]:
++        """
++        a dict of :class:`sqllineage.models.Table` to :class:`sqllineage.models.TableKeys`, the primary key and
++        foreign keys queried from metadata provider. Only tables in the lineage result with known keys are included.
++        """
++        if self._table_keys is None:
++            table_keys: dict[Table, TableKeys] = {}
++            # never query a provider that has no metadata
++            if self._metadata_provider:
++                for table in self._lineage_tables():
++                    if keys := self._metadata_provider.get_table_keys(table):
++                        table_keys[table] = keys
++            self._table_keys = table_keys
++        return dict(self._table_keys)
++
++    def _lineage_tables(self) -> list[Table]:
++        tables: set[Table] = set()
++        for dataset in (
++            self._sql_holder.source_tables
++            | self._sql_holder.target_tables
++            | self._sql_holder.intermediate_tables
++            | set(self._sql_holder.table_lineage_graph.retrieve_vertices_by_props())
++        ):
++            if isinstance(dataset, Table):
++                tables.add(dataset)
++        column_graph = self._sql_holder.column_lineage_graph
++        for column in column_graph.retrieve_vertices_by_props():
++            if isinstance(column, Column) and isinstance(column.parent, Table):
++                tables.add(column.parent)
++        return sorted(tables, key=str)
+ 
+     def draw(self) -> None:
+         """
+diff --git a/tests/core/test_table_keys.py b/tests/core/test_table_keys.py
+new file mode 100644
+index 0000000..b2799f2
+--- /dev/null
++++ b/tests/core/test_table_keys.py
+@@ -0,0 +1,349 @@
++import logging
++from unittest.mock import patch
++
++import pytest
++from sqlalchemy import text
++
++from sqllineage.cli import main
++from sqllineage.config import SQLLineageConfig
++from sqllineage.core.metadata.dummy import DummyMetaDataProvider
++from sqllineage.core.metadata.sqlalchemy import SQLAlchemyMetaDataProvider
++from sqllineage.core.metadata_provider import MetaDataProvider
++from sqllineage.core.models import ForeignKey, Schema, Table, TableKeys
++from sqllineage.runner import LineageRunner
++from sqllineage.utils.constant import LineageLevel
++
++from ..helpers import _gen_graph_operators
++
++parametrize_graph_operator = pytest.mark.parametrize(
++    "graph_operator", _gen_graph_operators(), ids=lambda go: go.rsplit(".", 1)[-1]
++)
++
++SQL = """INSERT INTO db2.report
++SELECT oi.order_id, oi.line_no, o.customer_id, c.name
++FROM db2.order_items oi
++JOIN db2.orders o ON oi.order_id = o.order_id
++JOIN db2.customers c ON o.customer_id = c.id"""
++
++CUSTOMERS_KEYS = TableKeys(primary_key=("id",))
++ORDERS_KEYS = TableKeys(
++    primary_key=("order_id",),
++    foreign_keys=(ForeignKey(("customer_id",), Table("db2.customers"), ("id",)),),
++)
++ORDER_ITEMS_KEYS = TableKeys(
++    primary_key=("order_id", "line_no"),
++    foreign_keys=(ForeignKey(("order_id",), Table("db2.orders"), ("order_id",)),),
++)
++EXPECTED_KEYS = {
++    Table("db2.customers"): CUSTOMERS_KEYS,
++    Table("db2.orders"): ORDERS_KEYS,
++    Table("db2.order_items"): ORDER_ITEMS_KEYS,
++}
++EXPECTED_TEXT = """Statements(#): 1
++Source Tables:
++    db2.customers [PK: id]
++    db2.order_items [PK: order_id, line_no; FK: order_id -> db2.orders(order_id)]
++    db2.orders [PK: order_id; FK: customer_id -> db2.customers(id)]
++Target Tables:
++    db2.report
++"""
++
++
++def _dummy_provider() -> DummyMetaDataProvider:
++    return DummyMetaDataProvider(
++        metadata={
++            "db2.customers": ["id", "name"],
++            "db2.orders": ["order_id", "customer_id"],
++            "db2.order_items": ["order_id", "line_no"],
++        },
++        primary_keys={
++            "db2.customers": ["id"],
++            "db2.orders": ["order_id"],
++            "db2.order_items": ["order_id", "line_no"],
++        },
++        foreign_keys={
++            "db2.orders": [
++                ForeignKey(("customer_id",), Table("db2.customers"), ("id",))
++            ],
++            "db2.order_items": [
++                ForeignKey(("order_id",), Table("db2.orders"), ("order_id",))
++            ],
++        },
++    )
++
++
++DDL = [
++    "ATTACH DATABASE ':memory:' AS db2",
++    "CREATE TABLE db2.customers (id INTEGER PRIMARY KEY, name TEXT)",
++    """CREATE TABLE db2.orders (
++    order_id INTEGER PRIMARY KEY,
++    customer_id INTEGER REFERENCES customers (id)
++)""",
++    """CREATE TABLE db2.order_items (
++    order_id INTEGER REFERENCES orders (order_id),
++    line_no INTEGER,
++    PRIMARY KEY (order_id, line_no)
++)""",
++]
++
++
++@pytest.fixture(scope="module")
++def sqlite_provider() -> SQLAlchemyMetaDataProvider:
++    provider = SQLAlchemyMetaDataProvider("sqlite:///:memory:")
++    with provider.engine.begin() as conn:
++        for ddl in DDL:
++            conn.execute(text(ddl))
++    return provider
++
++
++class ColumnsOnlyProvider(MetaDataProvider):
++    """a custom provider written before keys support, only with _get_table_columns"""
++
++    def _get_table_columns(self, schema: str, table: str, **kwargs) -> list[str]:
++        return {"db2.orders": ["order_id", "customer_id"]}.get(f"{schema}.{table}", [])
++
++
++class CountingProvider(DummyMetaDataProvider):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.key_lookups: list[str] = []
++
++    def get_table_keys(self, table: Table) -> TableKeys:
++        self.key_lookups.append(str(table))
++        return super().get_table_keys(table)
++
++
++class FailingKeysProvider(DummyMetaDataProvider):
++    def _get_primary_key(self, schema: str, table: str) -> list[str]:
++        raise RuntimeError("boom")
++
++    def _get_foreign_keys(self, schema: str, table: str) -> list[ForeignKey]:
++        raise RuntimeError("boom")
++
++
++def test_models_normalize_and_sort():
++    fk_b = ForeignKey(["Customer_ID"], Table("DB2.Customers"), ["ID"])
++    fk_a = ForeignKey(("a",), Table("db2.zzz"), ("x",))
++    fk_a2 = ForeignKey(("a",), Table("db2.aaa"), ("x",))
++    assert fk_b.columns == ("customer_id",)
++    assert fk_b.referred_columns == ("id",)
++    assert fk_b.referred_table == Table("db2.customers")
++    assert ForeignKey(('"Quoted"',), Table("t"), ("x",)).columns == ("Quoted",)
++    keys = TableKeys(primary_key=["Order_Id"], foreign_keys=(fk_b, fk_a, fk_a2))
++    assert keys.primary_key == ("order_id",)
++    assert keys.foreign_keys == (fk_a2, fk_a, fk_b)
++    assert keys == TableKeys(("order_id",), (fk_a, fk_b, fk_a2))
++    assert hash(keys) == hash(TableKeys(("order_id",), (fk_a, fk_b, fk_a2)))
++    assert keys
++    assert not TableKeys()
++    assert TableKeys() == TableKeys((), ())
++
++
++def test_dummy_provider_keys():
++    provider = _dummy_provider()
++    for table, keys in EXPECTED_KEYS.items():
++        assert provider.get_table_keys(table) == keys
++    assert provider.get_table_keys(Table("db2.unknown")) == TableKeys()
++    assert provider.get_table_keys(Table("unknown")) == TableKeys()
++
++
++def test_dummy_provider_bool():
++    assert not DummyMetaDataProvider()
++    assert not DummyMetaDataProvider({}, {}, {})
++    assert DummyMetaDataProvider({"db.t": ["c"]})
++    assert DummyMetaDataProvider(primary_keys={"db.t": ["c"]})
++    assert DummyMetaDataProvider(
++        foreign_keys={"db.t": [ForeignKey(("c",), Table("db.u"), ("c",))]}
++    )
++
++
++def test_sqlalchemy_provider_keys(sqlite_provider):
++    for table, keys in EXPECTED_KEYS.items():
++        assert sqlite_provider.get_table_keys(table) == keys
++    # columns are still available as before
++    columns = sqlite_provider.get_table_columns(Table("db2.orders"))
++    assert [c.raw_name for c in columns] == ["order_id", "customer_id"]
++
++
++def test_sqlalchemy_provider_missing_table(sqlite_provider, caplog):
++    with caplog.at_level(logging.WARNING, logger="sqllineage"):
++        assert sqlite_provider.get_table_keys(Table("db2.non_existing")) == TableKeys()
++        assert (
++            sqlite_provider.get_table_keys(Table("non_existing_schema.t"))
++            == TableKeys()
++        )
++        assert sqlite_provider.get_table_keys(Table("t")) == TableKeys()
++    assert "db2.non_existing" in caplog.text
++
++
++def test_custom_provider_only_columns():
++    provider = ColumnsOnlyProvider()
++    assert provider.get_table_keys(Table("db2.orders")) == TableKeys()
++    assert provider.get_table_keys(Table("db2.unknown")) == TableKeys()
++    runner = LineageRunner(SQL, metadata_provider=provider)
++    assert runner.get_table_keys() == {}
++    assert "[" not in str(runner)
++
++
++def test_provider_hooks_raising_never_raise():
++    provider = FailingKeysProvider({"db2.orders": ["order_id"]})
++    assert provider.get_table_keys(Table("db2.orders")) == TableKeys()
++    assert LineageRunner(SQL, metadata_provider=provider).get_table_keys() == {}
++
++
++@parametrize_graph_operator
++def test_runner_get_table_keys(graph_operator):
++    with SQLLineageConfig(GRAPH_OPERATOR_CLASS=graph_operator):
++        provider = CountingProvider(*_dummy_provider_args())
++        runner = LineageRunner(SQL, metadata_provider=provider)
++        assert runner.get_table_keys() == EXPECTED_KEYS
++        str(runner)
++        runner.to_cytoscape()
++        runner.to_cytoscape(level=LineageLevel.COLUMN)
++        assert runner.get_table_keys() == EXPECTED_KEYS
++        # each table is looked up at most once
++        assert len(provider.key_lookups) == len(set(provider.key_lookups))
++        assert set(provider.key_lookups) >= {
++            "db2.customers",
++            "db2.orders",
++            "db2.order_items",
++            "db2.report",
++        }
++
++
++def _dummy_provider_args():
++    p = _dummy_provider()
++    return p.metadata, p.primary_keys, p.foreign_keys
++
++
++def test_runner_never_queries_empty_provider():
++    provider = CountingProvider()
++    assert not provider
++    runner = LineageRunner(SQL, metadata_provider=provider)
++    assert runner.get_table_keys() == {}
++    str(runner)
++    runner.to_cytoscape(level=LineageLevel.COLUMN)
++    assert provider.key_lookups == []
++
++
++def test_runner_text_output():
++    runner = LineageRunner(SQL, metadata_provider=_dummy_provider())
++    assert str(runner) == EXPECTED_TEXT
++
++
++def test_runner_text_output_sqlalchemy(sqlite_provider):
++    runner = LineageRunner(SQL, metadata_provider=sqlite_provider)
++    assert runner.get_table_keys() == EXPECTED_KEYS
++    assert str(runner) == EXPECTED_TEXT
++
++
++def test_runner_text_output_intermediate_and_target_tables():
++    sql = """INSERT INTO db2.stage SELECT order_id FROM db2.orders;
++INSERT INTO db2.final SELECT order_id FROM db2.stage"""
++    provider = DummyMetaDataProvider(
++        primary_keys={"db2.stage": ["order_id"], "db2.final": ["order_id"]}
++    )
++    expected = """Statements(#): 2
++Source Tables:
++    db2.orders
++Target Tables:
++    db2.final [PK: order_id]
++Intermediate Tables:
++    db2.stage [PK: order_id]"""
++    assert str(LineageRunner(sql, metadata_provider=provider)) == expected
++
++
++def test_runner_text_output_without_keys_unchanged():
++    without = str(LineageRunner(SQL))
++    provider = DummyMetaDataProvider(_dummy_provider().metadata)
++    with_columns_only = str(LineageRunner(SQL, metadata_provider=provider))
++    assert without == with_columns_only
++    assert "[" not in without
++
++
++def test_cli_table_output(sqlite_provider, capsys):
++    with patch(
++        "sqllineage.cli.SQLAlchemyMetaDataProvider", return_value=sqlite_provider
++    ):
++        main(["-e", SQL, "--sqlalchemy_url=sqlite:///:memory:"])
++    assert capsys.readouterr().out == EXPECTED_TEXT + "\n"
++
++
++def _nodes(elements):
++    return {
++        e["data"]["id"]: e["data"]
++        for e in elements
++        if "source" not in e["data"] and "target" not in e["data"]
++    }
++
++
++def test_to_cytoscape_table_level():
++    results = []
++    for graph_operator in _gen_graph_operators():
++        with SQLLineageConfig(GRAPH_OPERATOR_CLASS=graph_operator):
++            runner = LineageRunner(SQL, metadata_provider=_dummy_provider())
++            results.append(runner.to_cytoscape())
++    nodes = _nodes(results[0])
++    assert nodes["db2.customers"] == {"id": "db2.customers", "primary_key": ["id"]}
++    assert nodes["db2.orders"] == {
++        "id": "db2.orders",
++        "primary_key": ["order_id"],
++        "foreign_keys": [
++            {
++                "columns": ["customer_id"],
++                "referred_table": "db2.customers",
++                "referred_columns": ["id"],
++            }
++        ],
++    }
++    assert nodes["db2.report"] == {"id": "db2.report"}
++    # networkx and rustworkx agree
++    assert _nodes(results[0]) == _nodes(results[1])
++
++
++def test_to_cytoscape_column_level():
++    results = []
++    for graph_operator in _gen_graph_operators():
++        with SQLLineageConfig(GRAPH_OPERATOR_CLASS=graph_operator):
++            runner = LineageRunner(SQL, metadata_provider=_dummy_provider())
++            results.append(runner.to_cytoscape(level=LineageLevel.COLUMN))
++    nodes = _nodes(results[0])
++    assert nodes["db2.order_items.order_id"]["keys"] == ["PK", "FK"]
++    assert nodes["db2.order_items.line_no"]["keys"] == ["PK"]
++    assert nodes["db2.orders.customer_id"]["keys"] == ["FK"]
++    assert "keys" not in nodes["db2.customers.name"]
++    assert "keys" not in nodes["db2.report.order_id"]
++    assert nodes["db2.orders"] == {
++        "id": "db2.orders",
++        "type": "Table",
++        "primary_key": ["order_id"],
++        "foreign_keys": [
++            {
++                "columns": ["customer_id"],
++                "referred_table": "db2.customers",
++                "referred_columns": ["id"],
++            }
++        ],
++    }
++    assert nodes["db2.customers"]["primary_key"] == ["id"]
++    assert "foreign_keys" not in nodes["db2.customers"]
++    assert nodes["db2.report"] == {"id": "db2.report", "type": "Table"}
++    # networkx and rustworkx agree
++    assert _nodes(results[0]) == _nodes(results[1])
++
++
++@pytest.mark.parametrize("level", [LineageLevel.TABLE, LineageLevel.COLUMN])
++def test_to_cytoscape_without_keys_unchanged(level):
++    metadata = _dummy_provider().metadata
++    for graph_operator in _gen_graph_operators():
++        with SQLLineageConfig(GRAPH_OPERATOR_CLASS=graph_operator):
++            provider = DummyMetaDataProvider(metadata)
++            runner = LineageRunner(SQL, metadata_provider=provider)
++            nodes = _nodes(runner.to_cytoscape(level))
++            for data in nodes.values():
++                assert not {"primary_key", "foreign_keys", "keys"} & set(data)
++
++
++def test_schema_default_referred_table():
++    fk = ForeignKey(("a",), Table("t", Schema("s")), ("b",))
++    assert str(fk) == "a -> s.t(b)"

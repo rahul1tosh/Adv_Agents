@@ -1,0 +1,128 @@
+{
+    "id": "f06b3f9f-d169-46e9-bda1-18bd635ff6b8",
+    "task_name": "hello-world-demo",
+    "trial_name": "hello-world-demo__oSj5nBh",
+    "trial_uri": "file:///Users/rahul/Desktop/da/q1/da/coding-eval/jobs/lineage-demo/hello-world-demo__oSj5nBh",
+    "task_id": {
+        "path": "hello-world-demo"
+    },
+    "source": null,
+    "task_checksum": "cc2bdf8f66c4671989dd3be7fa839a136a65bfdd355ed65ca0bbdf140f7baf91",
+    "config": {
+        "task": {
+            "path": "hello-world-demo",
+            "git_url": null,
+            "git_commit_id": null,
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": null
+        },
+        "trial_name": "hello-world-demo__oSj5nBh",
+        "trials_dir": "jobs/lineage-demo",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": 3.0,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "mini-swe-agent",
+            "import_path": null,
+            "model_name": "gemini/brawne",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {
+                "config": {
+                    "model": {
+                        "model_kwargs": {
+                            "api_base": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta",
+                            "max_tokens": 65536
+                        }
+                    }
+                }
+            },
+            "env": {
+                "GEMINI_API_BASE": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta",
+                "GOOGLE_BASE_URL": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta"
+            },
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "a025bea4-7157-4e5d-bc0b-7498a20c4279",
+        "source_trial": null
+    },
+    "agent_info": {
+        "name": "mini-swe-agent",
+        "version": "2.4.6",
+        "model_info": {
+            "name": "brawne",
+            "provider": "google"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 12991769,
+        "n_cache_tokens": 12463006,
+        "n_output_tokens": 153134,
+        "cost_usd": 0.0,
+        "rollout_details": null,
+        "metadata": null
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1.0
+        }
+    },
+    "verifier_environment_mode": "shared",
+    "exception_info": null,
+    "started_at": "2026-10-30T22:41:10.028480Z",
+    "finished_at": "2026-10-30T23:15:24.463827Z",
+    "environment_setup": {
+        "started_at": "2026-10-30T22:41:10.064635Z",
+        "finished_at": "2026-10-30T22:41:21.956609Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-10-30T22:41:21.956675Z",
+        "finished_at": "2026-10-30T22:42:58.750674Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-10-30T22:42:58.751040Z",
+        "finished_at": "2026-10-30T23:15:16.588172Z"
+    },
+    "verifier": {
+        "started_at": "2026-10-30T23:15:17.848121Z",
+        "finished_at": "2026-10-30T23:15:20.340619Z"
+    },
+    "step_results": null
+}
