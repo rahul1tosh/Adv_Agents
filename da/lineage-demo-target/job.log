@@ -1,0 +1,55 @@
+Skipping image OS validation for hb__11e25f44f87d53a1183a9fc5b03fc603: docker inspect returned 1
+Running command: set -euo pipefail; if ! command -v uv >/dev/null 2>&1; then  curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh; fi && if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null; then  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"; fi && if [ -f "$HOME/.local/bin/env" ]; then source "$HOME/.local/bin/env"; fi && export PATH="$HOME/.local/bin:$PATH" && uv tool install mini-swe-agent --with 'litellm[proxy]' && mini-swe-agent --help
+Command outputs captured
+Running command: mkdir -p /tmp/mswea-config
+cat > '/tmp/mswea-config/custom.yaml' << 'MSWEA_CONFIG_EOF_c0a6a164'
+model:
+  model_kwargs:
+    api_base: https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta
+    max_tokens: 65536
+
+MSWEA_CONFIG_EOF_c0a6a164
+
+Command outputs captured
+Running command: if [ -f "$HOME/.local/bin/env" ]; then . "$HOME/.local/bin/env"; else export PATH="$HOME/.local/bin:$PATH"; fi; mini-swe-agent --yolo --model=gemini/brawne --task='# Show primary and foreign keys alongside lineage
+
+sqllineage already gets table columns from a `MetaDataProvider` (e.g. `--sqlalchemy_url`). Get each table'"'"'s primary key and foreign keys from the same provider and show them with the table lineage.
+
+1. In `sqllineage.core.models`, add two value types:
+   - `ForeignKey(columns: tuple[str, ...], referred_table: Table, referred_columns: tuple[str, ...])`
+   - `TableKeys(primary_key: tuple[str, ...] = (), foreign_keys: tuple[ForeignKey, ...] = ())`
+
+   Normalize column names the way `get_table_columns` does. Sort foreign keys by (columns, referred_table).
+
+2. Add `MetaDataProvider.get_table_keys(table) -> TableKeys`. It returns empty keys for unknown tables and never raises.
+   - It is backed by non-abstract hooks `_get_primary_key(schema, table) -> list[str]` and `_get_foreign_keys(schema, table) -> list[ForeignKey]`, so existing custom providers keep working.
+   - `DummyMetaDataProvider(metadata=None, primary_keys=None, foreign_keys=None)`: both new arguments are keyed by `"schema.table"`. The provider is truthy if any argument is non-empty.
+   - `SQLAlchemyMetaDataProvider` reads keys by reflection. A missing table gives no keys and logs a warning.
+
+3. Add `LineageRunner.get_table_keys() -> dict[Table, TableKeys]`, covering the tables in the lineage result that have keys. Look each table up at most once, and never query a provider that has no metadata.
+
+4. In the table-level text output (`str(runner)` and the default CLI output), append keys to the tables that have them:
+
+   Source Tables:
+       db2.customers [PK: id]
+       db2.orders [PK: order_id; FK: customer_id -> db2.customers(id)]
+   ...
+
+5. In `to_cytoscape()`:
+   - Table nodes with keys get `"primary_key": [...]` and `"foreign_keys": [{"columns": [...], "referred_table": "...", "referred_columns": [...]}]`.
+   - At column level, columns that are part of a key also get `"keys": ["PK", "FK"]` (whichever apply, PK first).
+   - The result must be the same with networkx and rustworkx.
+
+Rules: when no keys are known, all output stays exactly the same and the existing tests pass unchanged.
+
+Out of scope: keys from CREATE/ALTER TABLE statements, the React UI, and the column-level text output.
+
+Done when:
+- Tests cover both providers (SQLite with a real PK and FK), a custom provider that only returns columns, the runner API, the text output, both `to_cytoscape` levels.
+- `docs/gear_up/metadata.rst` is updated.
+- `pytest`, `black --check .`, `ruff check .` and `mypy` pass.' --output=/logs/agent/mini-swe-agent.trajectory.json --cost-limit 0 -c mini -c /tmp/mswea-config/custom.yaml -c model.model_kwargs.extra_headers.X-Session-ID=hello-world-demo__gTkxS7A__agent --exit-immediately 2>&1 </dev/null | tee /logs/agent/mini-swe-agent.txt
+Command outputs captured
+Successfully converted trajectory to ATIF format: /Users/rahul/Desktop/da/q1/da/coding-eval/jobs/lineage-demo-target/hello-world-demo__gTkxS7A/agent/trajectory.json
+Collecting main service artifacts
+Running collect hook in service 'main': 'git config --global --add safe.directory /app; git -C /app add -A; git -C /app diff v0.1.0-init > /tmp/patch.diff 2>/dev/null; true'
+Collect hook in service 'main' completed

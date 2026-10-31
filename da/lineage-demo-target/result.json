@@ -1,0 +1,39 @@
+{
+    "id": "f632591b-9681-4402-929f-d44daa833beb",
+    "started_at": "2026-10-31T05:07:42.581838",
+    "updated_at": "2026-10-31T05:37:22.944298",
+    "finished_at": "2026-10-31T05:37:22.944298",
+    "n_total_trials": 1,
+    "stats": {
+        "n_completed_trials": 1,
+        "n_errored_trials": 0,
+        "n_running_trials": 0,
+        "n_pending_trials": 0,
+        "n_cancelled_trials": 0,
+        "n_retries": 0,
+        "evals": {
+            "mini-swe-agent__brawne__adhoc": {
+                "n_trials": 1,
+                "n_errors": 0,
+                "metrics": [
+                    {
+                        "mean": 1.0
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "1.0": [
+                            "hello-world-demo__gTkxS7A"
+                        ]
+                    }
+                },
+                "exception_stats": {}
+            }
+        },
+        "n_input_tokens": 9085723,
+        "n_cache_tokens": 8547922,
+        "n_output_tokens": 156019,
+        "cost_usd": 0.0
+    }
+}

@@ -1,0 +1,27 @@
+{
+    "task": {
+        "path": "/Users/rahul/Desktop/da/q1/da/coding-eval/hello-world-demo"
+    },
+    "trial_name": "hello-world-demo__gTkxS7A",
+    "trials_dir": "/Users/rahul/Desktop/da/q1/da/coding-eval/jobs/lineage-demo-target",
+    "agent_setup_timeout_multiplier": 3.0,
+    "agent": {
+        "name": "mini-swe-agent",
+        "model_name": "gemini/brawne",
+        "kwargs": {
+            "config": {
+                "model": {
+                    "model_kwargs": {
+                        "api_base": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta",
+                        "max_tokens": 65536
+                    }
+                }
+            }
+        },
+        "env": {
+            "GEMINI_API_BASE": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta",
+            "GOOGLE_BASE_URL": "https://app-llmproxy.dataannotation.tech/api/llm_proxy/gemini/v1beta"
+        }
+    },
+    "job_id": "f632591b-9681-4402-929f-d44daa833beb"
+}
