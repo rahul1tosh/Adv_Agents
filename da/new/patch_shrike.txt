@@ -1,503 +1,617 @@
-diff --git a/pgvector/_distance.py b/pgvector/_distance.py
-new file mode 100644
-index 0000000..9eb75c7
---- /dev/null
-+++ b/pgvector/_distance.py
-@@ -0,0 +1,118 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f033cf1..292f4b9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,7 @@
+ ## 0.5.2 (unreleased)
+ 
++- Added `l2_distance`, `max_inner_product`, `cosine_distance`, and `l1_distance` methods to `Vector`
++- Added `hamming_distance` and `jaccard_distance` methods to `Bit`
+ - Fixed memory leak with `register_vector` and `register_vector_async` for Psycopg 3
+ - Fixed error with `Bit` constructor and empty strings
+ - Fixed equality for `HalfVector` with signed zeros
+diff --git a/pgvector/_utils.py b/pgvector/_utils.py
+index 4cafc32..fbb18fd 100644
+--- a/pgvector/_utils.py
++++ b/pgvector/_utils.py
+@@ -1,3 +1,6 @@
 +from __future__ import annotations
-+from collections.abc import Iterable, Iterator, Sequence
-+import math
-+
-+Pairs = Iterable[tuple[float, float]]
-+
-+
-+def check_dimensions(left: int, right: int, /) -> None:
-+    if left != right:
-+        raise ValueError(f'different vector dimensions {left} and {right}')
-+
-+
-+def dense_pairs(left: Sequence[float], right: Sequence[float], /) -> list[tuple[float, float]]:
-+    check_dimensions(len(left), len(right))
-+    return list(zip(left, right))
++from array import array
++from collections.abc import Iterable
+ import sys
+ from typing import TYPE_CHECKING, TypeAlias
+ 
+@@ -21,3 +24,19 @@ def is_sparse_array(value: object, /) -> bool:
+     if (sparse := sys.modules.get('scipy.sparse')):
+         return isinstance(value, (sparse.sparray, sparse.spmatrix))
+     return False
 +
 +
-+def sparse_pairs(
-+    left_dim: int,
-+    left_indices: Sequence[int],
-+    left_values: Sequence[float],
-+    right_dim: int,
-+    right_indices: Sequence[int],
-+    right_values: Sequence[float],
-+    /
-+) -> list[tuple[float, float]]:
-+    check_dimensions(left_dim, right_dim)
-+    return list(_merge_sparse(left_indices, left_values, right_indices, right_values))
++def check_dims(a: int, b: int, kind: str, /) -> None:
++    if a != b:
++        raise ValueError(f'different {kind} {a} and {b}')
 +
 +
-+def _merge_sparse(
-+    left_indices: Sequence[int],
-+    left_values: Sequence[float],
-+    right_indices: Sequence[int],
-+    right_values: Sequence[float],
-+    /
-+) -> Iterator[tuple[float, float]]:
-+    i = 0
-+    j = 0
-+    while i < len(left_indices) and j < len(right_indices):
-+        if left_indices[i] == right_indices[j]:
-+            yield (left_values[i], right_values[j])
-+            i += 1
-+            j += 1
-+        elif left_indices[i] < right_indices[j]:
-+            yield (left_values[i], 0.0)
-+            i += 1
-+        else:
-+            yield (0.0, right_values[j])
-+            j += 1
-+    for k in range(i, len(left_indices)):
-+        yield (left_values[k], 0.0)
-+    for k in range(j, len(right_indices)):
-+        yield (0.0, right_values[k])
++def float32_array(values: Iterable[float], /) -> array[float]:
++    return array('f', values)
 +
 +
-+def l2_distance(pairs: Pairs, /) -> float:
-+    return math.sqrt(sum((a - b) * (a - b) for a, b in pairs))
-+
-+
-+def inner_product(pairs: Pairs, /) -> float:
-+    return sum(a * b for a, b in pairs)
-+
-+
-+def max_inner_product(pairs: Pairs, /) -> float:
-+    return -inner_product(pairs)
-+
-+
-+def cosine_distance(pairs: Pairs, /) -> float:
-+    dot = 0.0
-+    norm_left = 0.0
-+    norm_right = 0.0
-+    for a, b in pairs:
-+        dot += a * b
-+        norm_left += a * a
-+        norm_right += b * b
-+
-+    denominator = math.sqrt(norm_left * norm_right)
-+    if denominator == 0:
-+        return math.nan
-+
-+    similarity = dot / denominator
-+    similarity = max(-1.0, min(1.0, similarity))
-+    return 1.0 - similarity
-+
-+
-+def l1_distance(pairs: Pairs, /) -> float:
-+    return sum(abs(a - b) for a, b in pairs)
-+
-+
-+def check_bit_lengths(left: int, right: int, /) -> None:
-+    if left != right:
-+        raise ValueError(f'different bit lengths {left} and {right}')
-+
-+
-+def _bits_to_int(data: bytes, length: int, /) -> int:
-+    return int.from_bytes(data, byteorder='big') >> (8 * len(data) - length)
-+
-+
-+def _popcount(value: int, /) -> int:
-+    return bin(value).count('1')
-+
-+
-+def hamming_distance(left_length: int, left_data: bytes, right_length: int, right_data: bytes, /) -> float:
-+    check_bit_lengths(left_length, right_length)
-+    left = _bits_to_int(left_data, left_length)
-+    right = _bits_to_int(right_data, right_length)
-+    return float(_popcount(left ^ right))
-+
-+
-+def jaccard_distance(left_length: int, left_data: bytes, right_length: int, right_data: bytes, /) -> float:
-+    check_bit_lengths(left_length, right_length)
-+    left = _bits_to_int(left_data, left_length)
-+    right = _bits_to_int(right_data, right_length)
-+    ab = _popcount(left & right)
-+    if ab == 0:
-+        return 1.0
-+    return 1.0 - ab / (_popcount(left) + _popcount(right) - ab)
++def float32_sum(values: Iterable[float], /) -> float:
++    acc = array('f', [0.0])
++    for v in values:
++        acc[0] += v
++    return acc[0]
 diff --git a/pgvector/bit.py b/pgvector/bit.py
-index a9370e4..293e3aa 100644
+index a9370e4..79f92fa 100644
 --- a/pgvector/bit.py
 +++ b/pgvector/bit.py
-@@ -1,6 +1,7 @@
+@@ -1,7 +1,7 @@
  from __future__ import annotations
  from struct import pack, unpack_from
  from typing import TYPE_CHECKING
-+from . import _distance
- from ._utils import is_ndarray
+-from ._utils import is_ndarray
++from ._utils import check_dims, is_ndarray
  
  if TYPE_CHECKING:
-@@ -78,6 +79,19 @@ class Bit:
+     import numpy as np
+@@ -78,6 +78,38 @@ class Bit:
      def to_binary(self) -> bytes:
          return pack('>i', self._length) + self._data
  
-+    def hamming_distance(self, other: Bit | list[bool], /) -> float:
-+        other = self._coerce(other)
-+        return _distance.hamming_distance(self._length, self._data, other._length, other._data)
++    def hamming_distance(
++        self,
++        other: Bit | bytes | str | list[bool] | np.ndarray[tuple[int, ...], np.dtype[np.bool_ | np.uint8]],
++        /
++    ) -> float:
++        a, b = self._distance_operands(other)
++        return float((a ^ b).bit_count())
 +
-+    def jaccard_distance(self, other: Bit | list[bool], /) -> float:
-+        other = self._coerce(other)
-+        return _distance.jaccard_distance(self._length, self._data, other._length, other._data)
++    def jaccard_distance(
++        self,
++        other: Bit | bytes | str | list[bool] | np.ndarray[tuple[int, ...], np.dtype[np.bool_ | np.uint8]],
++        /
++    ) -> float:
++        a, b = self._distance_operands(other)
++        ab = (a & b).bit_count()
++        if ab == 0:
++            return 1.0
++        return 1 - (ab / (a.bit_count() + b.bit_count() - ab))
 +
-+    def _coerce(self, other: Bit | list[bool], /) -> Bit:
-+        if isinstance(other, Bit):
-+            return other
-+        return self.__class__(other)
++    def _distance_operands(
++        self,
++        other: Bit | bytes | str | list[bool] | np.ndarray[tuple[int, ...], np.dtype[np.bool_ | np.uint8]],
++        /
++    ) -> tuple[int, int]:
++        if not isinstance(other, Bit):
++            other = Bit(other)
++        check_dims(self._length, other._length, 'bit lengths')
++        return self._to_int(), other._to_int()
++
++    def _to_int(self) -> int:
++        return int.from_bytes(self._data, byteorder='big') >> (8 * len(self._data) - self._length)
 +
      @classmethod
      def from_text(cls, value: str, /) -> Bit:
          # cast to ensure always uses str constructor
-diff --git a/pgvector/halfvec.py b/pgvector/halfvec.py
-index 2b3b325..a8b2b97 100644
---- a/pgvector/halfvec.py
-+++ b/pgvector/halfvec.py
-@@ -3,6 +3,7 @@ from array import array
- import struct
- import sys
- from typing import TYPE_CHECKING
-+from . import _distance
- from ._utils import is_ndarray, ndarray
- 
- if TYPE_CHECKING:
-@@ -62,6 +63,23 @@ class HalfVector:
-         # TODO change to >hh in 0.6.0
-         return struct.pack('>HH', len(value), 0) + memoryview(value)
- 
-+    def l2_distance(self, other: HalfVector | list[float], /) -> float:
-+        return _distance.l2_distance(self._distance_pairs(other))
-+
-+    def max_inner_product(self, other: HalfVector | list[float], /) -> float:
-+        return _distance.max_inner_product(self._distance_pairs(other))
-+
-+    def cosine_distance(self, other: HalfVector | list[float], /) -> float:
-+        return _distance.cosine_distance(self._distance_pairs(other))
-+
-+    def l1_distance(self, other: HalfVector | list[float], /) -> float:
-+        return _distance.l1_distance(self._distance_pairs(other))
-+
-+    def _distance_pairs(self, other: HalfVector | list[float], /) -> list[tuple[float, float]]:
-+        if not isinstance(other, HalfVector):
-+            other = self.__class__(other)
-+        return _distance.dense_pairs(self.to_list(), other.to_list())
-+
-     @classmethod
-     def from_text(cls, value: str, /) -> HalfVector:
-         return cls(cls._from_text(value))
-diff --git a/pgvector/sparsevec.py b/pgvector/sparsevec.py
-index 76e1356..b1631c6 100644
---- a/pgvector/sparsevec.py
-+++ b/pgvector/sparsevec.py
-@@ -1,6 +1,7 @@
- from __future__ import annotations
- from struct import pack, unpack_from
- from typing import TYPE_CHECKING, Final, cast, overload
-+from . import _distance
- from ._utils import is_sparse_array, ndarray
- 
- if TYPE_CHECKING:
-@@ -94,6 +95,26 @@ class SparseVector:
-         nnz = len(self._indices)
-         return pack(f'>iii{nnz}i{nnz}f', self._dim, nnz, 0, *self._indices, *self._values)
- 
-+    def l2_distance(self, other: SparseVector | list[float], /) -> float:
-+        return _distance.l2_distance(self._distance_pairs(other))
-+
-+    def max_inner_product(self, other: SparseVector | list[float], /) -> float:
-+        return _distance.max_inner_product(self._distance_pairs(other))
-+
-+    def cosine_distance(self, other: SparseVector | list[float], /) -> float:
-+        return _distance.cosine_distance(self._distance_pairs(other))
-+
-+    def l1_distance(self, other: SparseVector | list[float], /) -> float:
-+        return _distance.l1_distance(self._distance_pairs(other))
-+
-+    def _distance_pairs(self, other: SparseVector | list[float], /) -> list[tuple[float, float]]:
-+        if not isinstance(other, SparseVector):
-+            other = self.__class__(other)
-+        return _distance.sparse_pairs(
-+            self._dim, self._indices, self._values,
-+            other._dim, other._indices, other._values
-+        )
-+
-     def _from_dict(self, d: dict[int, float], dim: int) -> None:
-         elements = [(i, v) for i, v in d.items() if v != 0]
-         elements.sort()
 diff --git a/pgvector/vector.py b/pgvector/vector.py
-index d86cba0..e4aef8a 100644
+index d86cba0..9f99234 100644
 --- a/pgvector/vector.py
 +++ b/pgvector/vector.py
-@@ -3,6 +3,7 @@ from array import array
+@@ -1,13 +1,17 @@
+ from __future__ import annotations
+ from array import array
++import math
++import operator
  import struct
  import sys
  from typing import TYPE_CHECKING
-+from . import _distance
- from ._utils import is_ndarray, ndarray
+-from ._utils import is_ndarray, ndarray
++from ._utils import check_dims, float32_array, float32_sum, is_ndarray, ndarray
  
  if TYPE_CHECKING:
-@@ -60,6 +61,23 @@ class Vector:
+     import numpy as np
+ 
++_MAX_DIM = 16000
++
+ 
+ class Vector:
+     _value: array[float]
+@@ -60,6 +64,60 @@ class Vector:
          # TODO change to >hh in 0.6.0
          return struct.pack('>HH', len(value), 0) + memoryview(value)
  
-+    def l2_distance(self, other: Vector | list[float], /) -> float:
-+        return _distance.l2_distance(self._distance_pairs(other))
++    def l2_distance(self, other: list[float] | ndarray | Vector, /) -> float:
++        a, b = self._distance_operands(other)
++        diff = float32_array(map(operator.sub, a, b))
++        return math.sqrt(float32_sum(float32_array(map(operator.mul, diff, diff))))
 +
-+    def max_inner_product(self, other: Vector | list[float], /) -> float:
-+        return _distance.max_inner_product(self._distance_pairs(other))
++    def max_inner_product(self, other: list[float] | ndarray | Vector, /) -> float:
++        a, b = self._distance_operands(other)
++        return -float32_sum(float32_array(map(operator.mul, a, b)))
 +
-+    def cosine_distance(self, other: Vector | list[float], /) -> float:
-+        return _distance.cosine_distance(self._distance_pairs(other))
++    def cosine_distance(self, other: list[float] | ndarray | Vector, /) -> float:
++        a, b = self._distance_operands(other)
++        similarity = float32_sum(float32_array(map(operator.mul, a, b)))
++        norma = float32_sum(float32_array(map(operator.mul, a, a)))
++        normb = float32_sum(float32_array(map(operator.mul, b, b)))
 +
-+    def l1_distance(self, other: Vector | list[float], /) -> float:
-+        return _distance.l1_distance(self._distance_pairs(other))
++        denominator = math.sqrt(norma * normb)
++        if denominator != 0:
++            similarity /= denominator
++        elif similarity != 0 and not math.isnan(similarity):
++            similarity = math.copysign(math.inf, similarity)
++        else:
++            similarity = math.nan
 +
-+    def _distance_pairs(self, other: Vector | list[float], /) -> list[tuple[float, float]]:
++        if similarity > 1:
++            similarity = 1.0
++        elif similarity < -1:
++            similarity = -1.0
++        return 1.0 - similarity
++
++    def l1_distance(self, other: list[float] | ndarray | Vector, /) -> float:
++        a, b = self._distance_operands(other)
++        return float32_sum(map(abs, float32_array(map(operator.sub, a, b))))
++
++    def _distance_operands(self, other: list[float] | ndarray | Vector, /) -> tuple[array[float], array[float]]:
 +        if not isinstance(other, Vector):
-+            other = self.__class__(other)
-+        return _distance.dense_pairs(self.to_list(), other.to_list())
++            other = Vector(other)
++        self._check_postgres()
++        other._check_postgres()
++        check_dims(len(self._value), len(other._value), 'vector dimensions')
++        return self._value, other._value
++
++    def _check_postgres(self) -> None:
++        for v in self._value[:_MAX_DIM]:
++            if math.isnan(v):
++                raise ValueError('NaN not allowed in vector')
++            if math.isinf(v):
++                raise ValueError('infinite value not allowed in vector')
++
++        dim = len(self._value)
++        if dim > _MAX_DIM:
++            raise ValueError(f'vector cannot have more than {_MAX_DIM} dimensions')
++        if dim < 1:
++            raise ValueError('vector must have at least 1 dimension')
 +
      @classmethod
      def from_text(cls, value: str, /) -> Vector:
          return cls(cls._from_text(value))
+diff --git a/tests/test_bit.py b/tests/test_bit.py
+index 9179cd3..af0e996 100644
+--- a/tests/test_bit.py
++++ b/tests/test_bit.py
+@@ -142,3 +142,82 @@ class TestBit:
+     def test_from_binary_negative_length(self) -> None:
+         with pytest.raises(ValueError, match='invalid length'):
+             Bit.from_binary(struct.pack('>i', -1))
++
++
++class TestBitDistance:
++    def test_hamming_distance(self) -> None:
++        assert Bit('101').hamming_distance(Bit('011')) == 2.0
++        assert Bit('101').hamming_distance('101') == 0.0
++        assert Bit('1111').hamming_distance('0000') == 4.0
++
++    def test_jaccard_distance(self) -> None:
++        assert Bit('101').jaccard_distance(Bit('011')) == 1 - 1 / 3
++        assert Bit('101').jaccard_distance('101') == 0.0
++        assert Bit('1100').jaccard_distance('0011') == 1.0
++
++    def test_return_type(self) -> None:
++        assert type(Bit('101').hamming_distance('011')) is float
++        assert type(Bit('101').jaccard_distance('011')) is float
++        assert type(Bit('000').jaccard_distance('000')) is float
++
++    def test_jaccard_distance_zeros(self) -> None:
++        assert Bit('000').jaccard_distance('000') == 1.0
++        assert Bit('100').jaccard_distance('000') == 1.0
++
++    def test_empty(self) -> None:
++        assert Bit('').hamming_distance('') == 0.0
++        assert Bit('').jaccard_distance([]) == 1.0
++        assert Bit(b'').hamming_distance(b'') == 0.0
++
++    def test_input_forms(self) -> None:
++        a = Bit('10100011')
++        assert a.hamming_distance(Bit('01100001')) == 3.0
++        assert a.hamming_distance('01100001') == 3.0
++        assert a.hamming_distance([False, True, True, False, False, False, False, True]) == 3.0
++        assert a.hamming_distance(b'\x61') == 3.0
++        assert Bit(b'\xa3').hamming_distance(b'\x61') == 3.0
++
++        if np is not None:
++            assert a.hamming_distance(np.array([0, 1, 1, 0, 0, 0, 0, 1], dtype=bool)) == 3.0
++            assert a.hamming_distance(np.unpackbits(np.array([0x61], dtype=np.uint8))) == 3.0
++
++    def test_invalid_input(self) -> None:
++        with pytest.raises(ValueError, match='expected bit string'):
++            Bit('101').hamming_distance('201')
++        with pytest.raises(ValueError, match='expected bytes, str, list, or ndarray'):
++            Bit('101').jaccard_distance(1)  # type: ignore
++
++    def test_different_lengths(self) -> None:
++        with pytest.raises(ValueError, match='^different bit lengths 3 and 2$'):
++            Bit('101').hamming_distance('11')
++        with pytest.raises(ValueError, match='^different bit lengths 2 and 3$'):
++            Bit('11').jaccard_distance('101')
++        with pytest.raises(ValueError, match='^different bit lengths 3 and 8$'):
++            Bit('101').hamming_distance(b'\xa0')
++        with pytest.raises(ValueError, match='^different bit lengths 0 and 1$'):
++            Bit('').jaccard_distance('0')
++
++    def test_padding_bits(self) -> None:
++        padded = Bit.from_binary(struct.pack('>iB', 3, 0xff))
++        assert padded.hamming_distance('000') == 3.0
++        assert padded.hamming_distance('111') == 0.0
++        assert padded.jaccard_distance('001') == 1 - 1 / 3
++        assert Bit('111').jaccard_distance(padded) == 0.0
++
++        padded = Bit.from_binary(struct.pack('>iBB', 9, 0x00, 0x7f))
++        assert padded.hamming_distance('000000000') == 0.0
++        assert padded.jaccard_distance('000000000') == 1.0
++
++    def test_long(self) -> None:
++        a = ''.join(random.choices(['0', '1'], k=1029))
++        b = ''.join(random.choices(['0', '1'], k=1029))
++        expected_hamming = sum(x != y for x, y in zip(a, b))
++        assert Bit(a).hamming_distance(b) == expected_hamming
++
++        ab = sum(x == y == '1' for x, y in zip(a, b))
++        expected_jaccard = 1 - ab / (a.count('1') + b.count('1') - ab)
++        assert Bit(a).jaccard_distance(b) == expected_jaccard
++
++    def test_symmetric(self) -> None:
++        assert Bit('1101').hamming_distance('0111') == Bit('0111').hamming_distance('1101')
++        assert Bit('1101').jaccard_distance('0111') == Bit('0111').jaccard_distance('1101')
 diff --git a/tests/test_distance.py b/tests/test_distance.py
 new file mode 100644
-index 0000000..97addd2
+index 0000000..8b99769
 --- /dev/null
 +++ b/tests/test_distance.py
-@@ -0,0 +1,230 @@
-+from pgvector import Bit, HalfVector, SparseVector, Vector
+@@ -0,0 +1,184 @@
++from collections.abc import Callable
 +import math
++from pgvector import Bit, Vector
++from pgvector.psycopg import register_vector
++import psycopg
 +import pytest
++import random
++import struct
++from typing import Any
++
++conn = psycopg.connect(dbname='pgvector_python_test', autocommit=True)
++
++conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
++
++register_vector(conn)
++
++VECTOR_OPERATORS: list[tuple[str, Callable[[Vector, Vector], float]]] = [
++    ('<->', Vector.l2_distance),
++    ('<#>', Vector.max_inner_product),
++    ('<=>', Vector.cosine_distance),
++    ('<+>', Vector.l1_distance)
++]
++
++BIT_OPERATORS: list[tuple[str, Callable[[Bit, Bit], float]]] = [
++    ('<~>', Bit.hamming_distance),
++    ('<%>', Bit.jaccard_distance)
++]
++
++
++def sql_distance(op: str, a: Any, b: Any, cast: str) -> float:
++    fa = '%t' if isinstance(a, str) else '%b'
++    fb = '%t' if isinstance(b, str) else '%b'
++    row = conn.execute(f'SELECT {fa}::{cast} {op.replace('%', '%%')} {fb}::{cast}', (a, b), binary=True).fetchone()
++    assert row is not None
++    return float(row[0])
++
++
++def sql_error(op: str, a: Any, b: Any, cast: str) -> str:
++    with pytest.raises(psycopg.DatabaseError) as error:
++        sql_distance(op, a, b, cast)
++    message = error.value.diag.message_primary
++    assert message is not None
++    return message
++
++
++def assert_identical(actual: float, expected: float) -> None:
++    if math.isnan(expected):
++        assert math.isnan(actual)
++    else:
++        assert actual == expected
++        assert math.copysign(1, actual) == math.copysign(1, expected)
++
++
++class TestVectorDistance:
++    @pytest.mark.parametrize('op,method', VECTOR_OPERATORS)
++    @pytest.mark.parametrize('a,b', [
++        ([1, 2, 3], [4, 5, 6]),
++        ([1, 1], [-1, -1]),
++        ([1, 0], [0, 1]),
++        ([1, 2], [2, 4]),
++        ([0.1], [0.1]),
++        ([0.5, -1.5], [2.25, 0.75]),
++        ([16777216, 1], [1, 1]),
++        ([0, 0], [1, 2]),
++        ([0, 0], [0, 0]),
++        ([0], [0]),
++        ([-0.0], [0]),
++        ([1], [-0.0]),
++        ([-1, 1], [1, 1]),
++        ([3e38], [-3e38]),
++        ([3e38, 3e38], [1, 1]),
++        ([3e38, 3e38], [0, 0]),
++        ([2e19], [2e19]),
++        ([1e-20], [1e-20]),
++        ([1e-20], [0]),
++        ([1e-30], [1e-30]),
++        ([1e-45], [1]),
++        ([1e-50], [1]),
++        ([1e-30], [1e19]),
++        ([-1e-30], [1e19]),
++        ([-1.5885683298110962], [-4.821664810180664]),
++        ([1.5885683298110962], [-4.821664810180664])
++    ])
++    def test_edge_cases(self, op: str, method: Callable[[Vector, Vector], float], a: list[float], b: list[float]) -> None:
++        va = Vector(a)
++        vb = Vector(b)
++        assert_identical(method(va, vb), sql_distance(op, va, vb, 'vector'))
++        assert_identical(method(va, vb), sql_distance(op, va.to_text(), vb.to_text(), 'vector'))
++
++    @pytest.mark.parametrize('op,method', VECTOR_OPERATORS)
++    def test_random_integers(self, op: str, method: Callable[[Vector, Vector], float]) -> None:
++        rng = random.Random(1)
++        for _ in range(50):
++            dim = rng.randint(1, 100)
++            a = Vector([rng.randint(-10, 10) for _ in range(dim)])
++            b = Vector([rng.randint(-10, 10) for _ in range(dim)])
++            assert_identical(method(a, b), sql_distance(op, a, b, 'vector'))
++
++    @pytest.mark.parametrize('op,method', VECTOR_OPERATORS)
++    def test_random_floats(self, op: str, method: Callable[[Vector, Vector], float]) -> None:
++        rng = random.Random(2)
++        for _ in range(50):
++            dim = rng.choice([1, 2, 3, 4, 7, 8, 16, 17, 100, 1000])
++            a = Vector([rng.uniform(-1, 1) for _ in range(dim)])
++            b = Vector([rng.uniform(-1, 1) for _ in range(dim)])
++            expected = sql_distance(op, a, b, 'vector')
++            assert method(a, b) == pytest.approx(expected, rel=1e-5, abs=1e-6 * dim)
++
++    @pytest.mark.parametrize('op,method', VECTOR_OPERATORS)
++    @pytest.mark.parametrize('a,b', [
++        ([1, 2], [1, 2, 3]),
++        ([1, 2, 3], [1, 2]),
++        ([], [1]),
++        ([1], []),
++        ([], []),
++        ([math.nan], [1]),
++        ([1], [1, math.nan]),
++        ([math.inf], [1]),
++        ([1, 2], [-math.inf, 2]),
++        ([math.inf, math.nan], [1]),
++        ([math.nan], [math.inf]),
++        ([1.0] * 16001, [1.0] * 16001)
++    ])
++    def test_errors(self, op: str, method: Callable[[Vector, Vector], float], a: list[float], b: list[float]) -> None:
++        va = Vector(a)
++        vb = Vector(b)
++        with pytest.raises(ValueError) as error:
++            method(va, vb)
++        assert str(error.value) == sql_error(op, va, vb, 'vector')
++
++    @pytest.mark.parametrize('op,method', VECTOR_OPERATORS)
++    def test_float32_overflow_input(self, op: str, method: Callable[[Vector, Vector], float]) -> None:
++        with pytest.raises(ValueError, match='infinite value not allowed in vector'):
++            method(Vector([1e39]), Vector([1]))
++        assert sql_error(op, '[1e39]', '[1]', 'vector') == '"1e39" is out of range for type vector'
++
++
++class TestBitDistance:
++    @pytest.mark.parametrize('op,method', BIT_OPERATORS)
++    @pytest.mark.parametrize('a,b', [
++        ('101', '011'),
++        ('101', '101'),
++        ('000', '000'),
++        ('100', '000'),
++        ('1100', '0011'),
++        ('', ''),
++        ('0', '1'),
++        ('11111111', '10000001'),
++        ('111111111', '000000001')
++    ])
++    def test_cases(self, op: str, method: Callable[[Bit, Bit], float], a: str, b: str) -> None:
++        ba = Bit(a)
++        bb = Bit(b)
++        assert_identical(method(ba, bb), sql_distance(op, ba, bb, 'varbit'))
++        assert_identical(method(ba, bb), sql_distance(op, a, b, 'varbit'))
++
++    @pytest.mark.parametrize('op,method', BIT_OPERATORS)
++    def test_random(self, op: str, method: Callable[[Bit, Bit], float]) -> None:
++        rng = random.Random(3)
++        for _ in range(50):
++            length = rng.randint(0, 2100)
++            a = Bit([rng.random() < 0.5 for _ in range(length)])
++            b = Bit([rng.random() < 0.5 for _ in range(length)])
++            assert_identical(method(a, b), sql_distance(op, a, b, 'varbit'))
++
++    @pytest.mark.parametrize('op,method', BIT_OPERATORS)
++    def test_padding_bits(self, op: str, method: Callable[[Bit, Bit], float]) -> None:
++        for a, b in [
++            (Bit.from_binary(struct.pack('>iB', 3, 0xff)), Bit('001')),
++            (Bit.from_binary(struct.pack('>iB', 3, 0x1f)), Bit('000')),
++            (Bit.from_binary(struct.pack('>iBB', 9, 0x80, 0x7f)), Bit.from_binary(struct.pack('>iBB', 9, 0x80, 0x3f)))
++        ]:
++            assert_identical(method(a, b), sql_distance(op, a, b, 'varbit'))
++
++    @pytest.mark.parametrize('op,method', BIT_OPERATORS)
++    @pytest.mark.parametrize('a,b', [
++        ('101', '11'),
++        ('11', '101'),
++        ('', '0')
++    ])
++    def test_different_lengths(self, op: str, method: Callable[[Bit, Bit], float], a: str, b: str) -> None:
++        with pytest.raises(ValueError) as error:
++            method(Bit(a), Bit(b))
++        assert str(error.value) == sql_error(op, Bit(a), Bit(b), 'varbit')
+diff --git a/tests/test_vector.py b/tests/test_vector.py
+index 13a9cc7..0ef4194 100644
+--- a/tests/test_vector.py
++++ b/tests/test_vector.py
+@@ -1,3 +1,4 @@
++import math
+ from pgvector import Vector
+ import pytest
+ import struct
+@@ -136,3 +137,151 @@ class TestVector:
+     def test_from_binary_non_zero_unused(self) -> None:
+         with pytest.raises(ValueError, match='expected unused to be 0'):
+             Vector.from_binary(struct.pack('>hh', 0, 1))
 +
 +
 +class TestVectorDistance:
 +    def test_l2_distance(self) -> None:
-+        assert Vector([1, 2, 3]).l2_distance(Vector([4, 6, 3])) == 5.0
-+
-+    def test_l2_distance_list(self) -> None:
-+        assert Vector([1, 2, 3]).l2_distance([4, 6, 3]) == 5.0
-+
-+    def test_l2_distance_same(self) -> None:
-+        assert Vector([1, 2, 3]).l2_distance([1, 2, 3]) == 0.0
-+
-+    def test_l2_distance_empty(self) -> None:
-+        assert Vector([]).l2_distance([]) == 0.0
++        assert Vector([1, 1, 1]).l2_distance(Vector([2, 2, 2])) == math.sqrt(3)
++        assert Vector([3, 4]).l2_distance([0, 0]) == 5.0
 +
 +    def test_max_inner_product(self) -> None:
-+        assert Vector([1, 2, 3]).max_inner_product(Vector([4, 5, 6])) == -32.0
-+
-+    def test_max_inner_product_list(self) -> None:
-+        assert Vector([1, 2, 3]).max_inner_product([4, 5, 6]) == -32.0
-+
-+    def test_max_inner_product_negative_inner_product(self) -> None:
-+        assert Vector([1, 2]).max_inner_product([-3, -4]) == 11.0
-+
-+    def test_max_inner_product_zero(self) -> None:
-+        assert Vector([1, 0]).max_inner_product([0, 1]) == 0.0
++        assert Vector([1, 1, 1]).max_inner_product(Vector([2, 2, 2])) == -6.0
++        assert Vector([1, -2]).max_inner_product([3, 4]) == 5.0
 +
 +    def test_cosine_distance(self) -> None:
-+        assert Vector([1, 0]).cosine_distance(Vector([0, 1])) == 1.0
++        assert Vector([1, 1]).cosine_distance(Vector([-1, -1])) == 2.0
++        assert Vector([1, 0]).cosine_distance([0, 1]) == 1.0
++        assert Vector([1, 2]).cosine_distance([2, 4]) == 0.0
 +
-+    def test_cosine_distance_list(self) -> None:
-+        assert Vector([1, 1]).cosine_distance([2, 2]) == pytest.approx(0.0)
++    def test_l1_distance(self) -> None:
++        assert Vector([1, 1, 1]).l1_distance(Vector([2, 2, 2])) == 3.0
++        assert Vector([1, -2]).l1_distance([-1, 2]) == 6.0
 +
-+    def test_cosine_distance_opposite(self) -> None:
-+        assert Vector([1, 2]).cosine_distance([-1, -2]) == pytest.approx(2.0)
++    def test_return_type(self) -> None:
++        a = Vector([1, 2])
++        for value in [a.l2_distance([1, 2]), a.max_inner_product([1, 2]), a.cosine_distance([1, 2]), a.l1_distance([1, 2])]:
++            assert type(value) is float
++
++    def test_input_forms(self) -> None:
++        a = Vector([1, 2, 3])
++        expected = a.l2_distance(Vector([3, 2, 1]))
++        assert a.l2_distance([3, 2, 1]) == expected
++        assert a.l2_distance([3.0, 2.0, 1.0]) == expected
++
++        if np is not None:
++            assert a.l2_distance(np.array([3, 2, 1], dtype=np.float32)) == expected
++            assert a.l2_distance(np.array([3, 2, 1], dtype=np.float64)) == expected
++
++    def test_invalid_input(self) -> None:
++        with pytest.raises(ValueError, match='expected list or ndarray'):
++            Vector([1]).l2_distance(1)  # type: ignore
++        with pytest.raises(ValueError, match=r'expected list\[float\]'):
++            Vector([1]).l2_distance(['one'])  # type: ignore
++
++    def test_float32_precision(self) -> None:
++        assert Vector([0.1]).max_inner_product([0.1]) == -0.010000000707805157
++        assert Vector([16777216, 1]).l1_distance([0, 0]) == 16777216.0
++        assert Vector([16777216, 1]).max_inner_product([1, 1]) == -16777216.0
++
++    def test_different_dimensions(self) -> None:
++        methods = [Vector.l2_distance, Vector.max_inner_product, Vector.cosine_distance, Vector.l1_distance]
++        for method in methods:
++            with pytest.raises(ValueError, match='^different vector dimensions 2 and 3$'):
++                method(Vector([1, 2]), [1, 2, 3])
++            with pytest.raises(ValueError, match='^different vector dimensions 3 and 2$'):
++                method(Vector([1, 2, 3]), [1, 2])
++
++    def test_empty(self) -> None:
++        with pytest.raises(ValueError, match='^vector must have at least 1 dimension$'):
++            Vector([]).l2_distance([])
++        with pytest.raises(ValueError, match='^vector must have at least 1 dimension$'):
++            Vector([1]).cosine_distance([])
++
++    def test_too_many_dimensions(self) -> None:
++        with pytest.raises(ValueError, match='^vector cannot have more than 16000 dimensions$'):
++            Vector([1.0] * 16001).l2_distance([1.0] * 16001)
++        assert Vector([1.0] * 16000).l1_distance([2.0] * 16000) == 16000.0
++
++    def test_nan(self) -> None:
++        with pytest.raises(ValueError, match='^NaN not allowed in vector$'):
++            Vector([1, math.nan]).l2_distance([1, 2])
++        with pytest.raises(ValueError, match='^NaN not allowed in vector$'):
++            Vector([1, 2]).max_inner_product([math.nan, 2])
++        with pytest.raises(ValueError, match='^NaN not allowed in vector$'):
++            Vector([math.nan]).cosine_distance([1, 2])
++
++    def test_infinite(self) -> None:
++        with pytest.raises(ValueError, match='^infinite value not allowed in vector$'):
++            Vector([1, math.inf]).l1_distance([1, 2])
++        with pytest.raises(ValueError, match='^infinite value not allowed in vector$'):
++            Vector([1, 2]).cosine_distance([-math.inf, 2])
++
++    def test_check_order(self) -> None:
++        with pytest.raises(ValueError, match='^infinite value not allowed in vector$'):
++            Vector([math.inf, math.nan]).l2_distance([1])
++        with pytest.raises(ValueError, match='^NaN not allowed in vector$'):
++            Vector([math.nan]).l2_distance([math.inf])
++        with pytest.raises(ValueError, match='^vector must have at least 1 dimension$'):
++            Vector([1]).l2_distance([])
++
++    def test_float32_overflow_input(self) -> None:
++        with pytest.raises(ValueError, match='^infinite value not allowed in vector$'):
++            Vector([1e39]).l2_distance([1])
++
++    def test_float32_overflow(self) -> None:
++        assert Vector([3e38]).l2_distance([-3e38]) == math.inf
++        assert Vector([3e38]).l1_distance([-3e38]) == math.inf
++        assert Vector([3e38, 3e38]).l1_distance([0, 0]) == math.inf
++        assert Vector([3e38, 3e38]).max_inner_product([1, 1]) == -math.inf
++        assert Vector([2e19]).max_inner_product([2e19]) == -math.inf
++        assert math.isnan(Vector([2e19]).cosine_distance([2e19]))
++        assert math.isnan(Vector([3e38, -3e38]).cosine_distance([3e38, 3e38]))
++
++    def test_float32_underflow(self) -> None:
++        assert Vector([1e-50]).to_list() == [0.0]
++        assert Vector([1e-20]).max_inner_product([1e-20]) == -9.99994610111476e-41
++        assert Vector([1e-20]).l2_distance([0]) == 9.999973050521066e-21
++
++        value = Vector([1e-30]).max_inner_product([1e-30])
++        assert value == 0.0 and math.copysign(1, value) == -1
++        assert Vector([1e-30]).l2_distance([0]) == 0.0
++        assert Vector([1e-45]).max_inner_product([1]) == -1.401298464324817e-45
 +
 +    def test_cosine_distance_zero_vector(self) -> None:
 +        assert math.isnan(Vector([0, 0]).cosine_distance([1, 2]))
 +        assert math.isnan(Vector([1, 2]).cosine_distance([0, 0]))
 +        assert math.isnan(Vector([0, 0]).cosine_distance([0, 0]))
++        assert math.isnan(Vector([-0.0]).cosine_distance([0]))
 +
-+    def test_l1_distance(self) -> None:
-+        assert Vector([1, 2, 3]).l1_distance(Vector([4, 0, 3])) == 5.0
++    def test_cosine_distance_norm_underflow(self) -> None:
++        assert Vector([1e-30]).cosine_distance([1e19]) == 0.0
++        assert Vector([-1e-30]).cosine_distance([1e19]) == 2.0
++        assert Vector([1e-30, 1]).cosine_distance([1e19, 0]) == 1.0
 +
-+    def test_l1_distance_list(self) -> None:
-+        assert Vector([1, -2, 3]).l1_distance([-1, 2, 3]) == 6.0
++    def test_cosine_distance_clamp(self) -> None:
++        assert Vector([-1.5885683298110962]).cosine_distance([-4.821664810180664]) == 0.0
++        assert Vector([1.5885683298110962]).cosine_distance([-4.821664810180664]) == 2.0
 +
-+    def test_dimension_mismatch(self) -> None:
-+        a = Vector([1, 2, 3])
-+        for method in [a.l2_distance, a.max_inner_product, a.cosine_distance, a.l1_distance]:
-+            with pytest.raises(ValueError) as error:
-+                method(Vector([1, 2]))
-+            assert str(error.value) == 'different vector dimensions 3 and 2'
++    def test_signed_zero(self) -> None:
++        def is_negative_zero(value: float) -> bool:
++            return value == 0 and math.copysign(1, value) == -1
 +
-+            with pytest.raises(ValueError) as error:
-+                method([1, 2])
-+            assert str(error.value) == 'different vector dimensions 3 and 2'
++        def is_positive_zero(value: float) -> bool:
++            return value == 0 and math.copysign(1, value) == 1
 +
-+    def test_invalid_list(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([1, 2]).l2_distance([1, 'two'])  # type: ignore
-+        assert str(error.value) == 'expected list[float]'
++        assert is_negative_zero(Vector([0]).max_inner_product([0]))
++        assert is_negative_zero(Vector([-0.0]).max_inner_product([0]))
++        assert is_negative_zero(Vector([1]).max_inner_product([-0.0]))
++        assert is_negative_zero(Vector([-1, 1]).max_inner_product([1, 1]))
++        assert is_positive_zero(Vector([-0.0]).l2_distance([0]))
++        assert is_positive_zero(Vector([-0.0]).l1_distance([0]))
++        assert is_positive_zero(Vector([1]).cosine_distance([1]))
++        assert is_positive_zero(Vector([-0.0, 1]).cosine_distance([0, 1]))
 +
-+
-+class TestHalfVectorDistance:
-+    def test_l2_distance(self) -> None:
-+        assert HalfVector([1, 2, 3]).l2_distance(HalfVector([4, 6, 3])) == 5.0
-+
-+    def test_l2_distance_list(self) -> None:
-+        assert HalfVector([1, 2, 3]).l2_distance([4, 6, 3]) == 5.0
-+
-+    def test_l2_distance_precision(self) -> None:
-+        assert HalfVector([1.0001]).l2_distance([1]) == 0.0
-+
-+    def test_max_inner_product(self) -> None:
-+        assert HalfVector([1, 2, 3]).max_inner_product(HalfVector([4, 5, 6])) == -32.0
-+
-+    def test_max_inner_product_list(self) -> None:
-+        assert HalfVector([1, 2, 3]).max_inner_product([4, 5, 6]) == -32.0
-+
-+    def test_max_inner_product_negative_inner_product(self) -> None:
-+        assert HalfVector([1, 2]).max_inner_product([-3, -4]) == 11.0
-+
-+    def test_cosine_distance(self) -> None:
-+        assert HalfVector([1, 0]).cosine_distance(HalfVector([0, 1])) == 1.0
-+
-+    def test_cosine_distance_list(self) -> None:
-+        assert HalfVector([1, 1]).cosine_distance([2, 2]) == pytest.approx(0.0)
-+
-+    def test_cosine_distance_opposite(self) -> None:
-+        assert HalfVector([1, 2]).cosine_distance([-1, -2]) == pytest.approx(2.0)
-+
-+    def test_cosine_distance_zero_vector(self) -> None:
-+        assert math.isnan(HalfVector([0, 0]).cosine_distance([1, 2]))
-+        assert math.isnan(HalfVector([1, 2]).cosine_distance([0, 0]))
-+        assert math.isnan(HalfVector([0, 0]).cosine_distance([0, 0]))
-+
-+    def test_l1_distance(self) -> None:
-+        assert HalfVector([1, 2, 3]).l1_distance(HalfVector([4, 0, 3])) == 5.0
-+
-+    def test_l1_distance_list(self) -> None:
-+        assert HalfVector([1, -2, 3]).l1_distance([-1, 2, 3]) == 6.0
-+
-+    def test_dimension_mismatch(self) -> None:
-+        a = HalfVector([1, 2, 3])
-+        for method in [a.l2_distance, a.max_inner_product, a.cosine_distance, a.l1_distance]:
-+            with pytest.raises(ValueError) as error:
-+                method(HalfVector([1, 2]))
-+            assert str(error.value) == 'different vector dimensions 3 and 2'
-+
-+            with pytest.raises(ValueError) as error:
-+                method([1, 2])
-+            assert str(error.value) == 'different vector dimensions 3 and 2'
-+
-+
-+class TestSparseVectorDistance:
-+    def test_l2_distance(self) -> None:
-+        a = SparseVector({0: 1, 2: 3}, 4)
-+        b = SparseVector({1: 4, 2: 3, 3: 12}, 4)
-+        assert a.l2_distance(b) == pytest.approx(math.sqrt(161))
-+
-+    def test_l2_distance_list(self) -> None:
-+        assert SparseVector([1, 0, 3]).l2_distance([4, 4, 3]) == 5.0
-+
-+    def test_l2_distance_empty(self) -> None:
-+        assert SparseVector({}, 3).l2_distance(SparseVector({}, 3)) == 0.0
-+
-+    def test_max_inner_product(self) -> None:
-+        a = SparseVector({0: 1, 2: 3}, 4)
-+        b = SparseVector({1: 4, 2: 5, 3: 6}, 4)
-+        assert a.max_inner_product(b) == -15.0
-+
-+    def test_max_inner_product_list(self) -> None:
-+        assert SparseVector([1, 2, 3]).max_inner_product([4, 5, 6]) == -32.0
-+
-+    def test_max_inner_product_negative_inner_product(self) -> None:
-+        assert SparseVector([1, 0, 2]).max_inner_product([-3, 7, -4]) == 11.0
-+
-+    def test_max_inner_product_disjoint(self) -> None:
-+        assert SparseVector({0: 1}, 2).max_inner_product(SparseVector({1: 1}, 2)) == 0.0
-+
-+    def test_cosine_distance(self) -> None:
-+        assert SparseVector({0: 1}, 2).cosine_distance(SparseVector({1: 1}, 2)) == 1.0
-+
-+    def test_cosine_distance_list(self) -> None:
-+        assert SparseVector([1, 0, 1]).cosine_distance([2, 0, 2]) == pytest.approx(0.0)
-+
-+    def test_cosine_distance_opposite(self) -> None:
-+        assert SparseVector([1, 0, 2]).cosine_distance([-1, 0, -2]) == pytest.approx(2.0)
-+
-+    def test_cosine_distance_zero_vector(self) -> None:
-+        assert math.isnan(SparseVector({}, 2).cosine_distance([1, 2]))
-+        assert math.isnan(SparseVector([1, 2]).cosine_distance(SparseVector({}, 2)))
-+        assert math.isnan(SparseVector({}, 2).cosine_distance(SparseVector({}, 2)))
-+
-+    def test_l1_distance(self) -> None:
-+        a = SparseVector({0: 1, 2: 3}, 4)
-+        b = SparseVector({1: 4, 2: 5, 3: -6}, 4)
-+        assert a.l1_distance(b) == 13.0
-+
-+    def test_l1_distance_list(self) -> None:
-+        assert SparseVector([1, -2, 0]).l1_distance([-1, 2, 0]) == 6.0
-+
-+    def test_matches_dense(self) -> None:
-+        a = [1.5, 0, -2, 0, 4]
-+        b = [0, 3, -1, 0, 0.5]
-+        for method in ['l2_distance', 'max_inner_product', 'cosine_distance', 'l1_distance']:
-+            sparse = getattr(SparseVector(a), method)(SparseVector(b))
-+            dense = getattr(Vector(a), method)(Vector(b))
-+            assert sparse == pytest.approx(dense)
-+
-+    def test_dimension_mismatch(self) -> None:
-+        a = SparseVector({0: 1}, 3)
-+        for method in [a.l2_distance, a.max_inner_product, a.cosine_distance, a.l1_distance]:
-+            with pytest.raises(ValueError) as error:
-+                method(SparseVector({0: 1}, 2))
-+            assert str(error.value) == 'different vector dimensions 3 and 2'
-+
-+            with pytest.raises(ValueError) as error:
-+                method([1, 2])
-+            assert str(error.value) == 'different vector dimensions 3 and 2'
-+
-+
-+class TestBitDistance:
-+    def test_hamming_distance(self) -> None:
-+        assert Bit('101').hamming_distance(Bit('111')) == 1.0
-+
-+    def test_hamming_distance_list(self) -> None:
-+        assert Bit('101').hamming_distance([False, True, False]) == 3.0
-+
-+    def test_hamming_distance_same(self) -> None:
-+        assert Bit('1011001011').hamming_distance(Bit('1011001011')) == 0.0
-+
-+    def test_hamming_distance_empty(self) -> None:
-+        assert Bit('').hamming_distance(Bit('')) == 0.0
-+
-+    def test_hamming_distance_multiple_bytes(self) -> None:
-+        assert Bit('111111111').hamming_distance(Bit('000000000')) == 9.0
-+
-+    def test_hamming_distance_ignores_padding(self) -> None:
-+        a = Bit.from_binary(b'\x00\x00\x00\x03\xff')
-+        assert a.hamming_distance(Bit('111')) == 0.0
-+
-+    def test_hamming_distance_length_mismatch(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Bit('101').hamming_distance(Bit('10'))
-+        assert str(error.value) == 'different bit lengths 3 and 2'
-+
-+    def test_jaccard_distance(self) -> None:
-+        assert Bit('1100').jaccard_distance(Bit('1010')) == pytest.approx(2 / 3)
-+
-+    def test_jaccard_distance_list(self) -> None:
-+        assert Bit('1100').jaccard_distance([True, False, True, False]) == pytest.approx(2 / 3)
-+
-+    def test_jaccard_distance_same(self) -> None:
-+        assert Bit('1101').jaccard_distance(Bit('1101')) == 0.0
-+
-+    def test_jaccard_distance_disjoint(self) -> None:
-+        assert Bit('1100').jaccard_distance(Bit('0011')) == 1.0
-+
-+    def test_jaccard_distance_zero(self) -> None:
-+        assert Bit('0000').jaccard_distance(Bit('0000')) == 1.0
-+
-+    def test_jaccard_distance_length_mismatch(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Bit('101').jaccard_distance([True, False])
-+        assert str(error.value) == 'different bit lengths 3 and 2'
++    def test_symmetric(self) -> None:
++        a = Vector([0.1, -0.2, 0.3])
++        b = Vector([-0.4, 0.5, 0.6])
++        assert a.l2_distance(b) == b.l2_distance(a)
++        assert a.max_inner_product(b) == b.max_inner_product(a)
++        assert a.cosine_distance(b) == b.cosine_distance(a)
++        assert a.l1_distance(b) == b.l1_distance(a)
