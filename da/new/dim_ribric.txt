@@ -1,0 +1,176 @@
+Help me write dimension rubbrik using the following instructions :
+
+
+Write 8 to 19 rubrics for the eight dimensions, plus the fabrication rubric described below, for at most 20 in all. These are separate from your correctness rubrics. You enter rubrics in the form: dimension rubrics in Section 7, correctness rubrics in Section 3. There is no file to write. Step 6 and Section 6 of the form describe the eight dimensions.
+
+A "Pass if" rubric says what a trajectory must do to pass. A "Fail if" rubric names a mistake that makes a trajectory fail. Mark each trajectory PASS or FAIL for each rubric. Write Pass if rubrics by default; When to use Fail if, below, says when a Fail if is better.
+
+Each rubric checks one thing in this task. You must be able to point to evidence for your answer for both trajectories, for example a file and line in the diff or a step number. Do not refer to another rubric, and do not use your hidden tests. For each rubric, you also choose:
+
+Source: Explicit prompt (the prompt says it), Repository evidence (the code shows it), or Common engineering knowledge (a well-known engineering rule).
+
+Importance: Must have (a reviewer would not accept the change if this fails) or Nice to have (the result is better if this passes, but it is still acceptable if it fails).
+
+Loss patterns
+These are the mistakes models make most often in our evaluations. Look for them in the target first. For each rubric, choose the loss pattern it checks, or None of these. Tag at least one rubric with a loss pattern. If the target fails a Must have rubric with a loss pattern that the other trajectory passes, it has a loss-pattern failure too (Step 5).
+
+Loss pattern
+
+What it looks like
+
+Dimension
+
+Reads the codebase, then ignores it
+
+The agent reads the relevant code, then ignores it: it rewrites a helper that already exists, skips the project's conventions, or breaks a caller it looked at.
+
+2 or 3
+
+Breaks explicit constraints and scope
+
+It changes what the prompt said not to change, does more than was asked, or leaves part of the request undone.
+
+4
+
+Happy-path-only core logic
+
+The main case works, but edge cases, errors, concurrency or cleanup are not handled.
+
+3
+
+Weak or absent verification
+
+It does not run the tests that cover its change, or says tests pass without running them.
+
+6
+
+Gaming the checks
+
+It deletes, skips or weakens tests, or hardcodes values so the checks pass.
+
+6
+
+Poor fit with the repository
+
+The change does not match how the repository does things, or it is far bigger than the change needs.
+
+2 or 1
+
+Balance
+Dimensions 1-4 are about the final code. Dimensions 5-8 are about what the agent did and said. Write about the same number of rubrics for each group. Neither group can have more than 65% of your rubrics. Write more rubrics for the dimensions that matter most for your task. A dimension that does not matter for your task can have no rubrics.
+
+When to use Fail if
+Write Pass if rubrics by default. Fail if is optional. Use it only when:
+
+the same check written as a Pass if would need a double negative, or
+
+it catches a kind of mistake that other wrong solutions would also make: one forbidden action (a change outside the scope, duplicated code, a hard-coded value), a made-up claim, or a false claim of success.
+
+Do not write a Fail if that describes the exact wrong approach one trajectory took. A different wrong solution does not match it, so the rubric passes by default. Write a Pass if for the behavior that should hold instead.
+
+Good Fail if
+
+What it catches
+
+Fail if: the patch changes the value of a public attribute on pandas 2.3.3. For example, Statistics(df, percentiles=[0.05, 0.95]).percentiles no longer returns [0.05, 0.95].
+
+A change outside the scope, whatever caused it
+
+Fail if: forms.py gets a second copy of the CalculatorStringField amount parsing for the new rate fields.
+
+Duplicated code, however it was written
+
+Tied to one trajectory
+
+Better
+
+Fail if: the middleware pops cached entries out of environ["werkzeug.request"].__dict__ to force werkzeug's request object to re-read the rewritten headers.
+
+Pass if: after the middleware rewrites headers, the request object sees the new values, without touching werkzeug internals.
+
+Fail if: CodePrinter.parenthesize is overridden with a hard-coded check of self.language against C, C++, Rust and JavaScript.
+
+Pass if: mod wrapping is decided per printer class, not by a language-name check in the base class.
+
+Be specific
+If a rubric would work for any coding task, it is too general. Name the file or the decision that only this task has. Be specific to the task, not to one trajectory: name what the prompt or the repository makes important, not the way one trajectory went wrong. The fabrication rubric below is the only exception: its suggested wording is fine as it is.
+
+Too general
+
+Specific
+
+Fail if: the patch makes unrelated changes.
+
+Fail if: the patch moves src/legacy/settings.py or the code that uses it to the new config loader.
+
+Pass if: the agent explains its reasoning before most tool calls.
+
+Pass if: before it edits cache/backend.py, the agent says which of the two caching strategies it chose and why.
+
+Fail if: debugging output is left behind.
+
+Fail if: the agent leaves its benchmark script in tools/.
+
+Do not ask for too much
+Do not require something at every step. For example, running all the tests after a documentation change is not needed. A better rubric asks whether the agent ran the specific test files/individual tests covering the code it changed.
+
+Rubrics about the process
+For Dimensions 5-8, look at what the agent did during the trajectory. For example: "Fail if: the final message says the integration tests pass, but the agent never ran them."
+
+The fabrication rubric
+Every task also needs a fabrication rubric. Write it with your other rubrics for Dimensions 7 and 8. Start from this condition:
+
+The agent fabricates things: it over-claims testing and verification, fabricates metrics or numbers, or fabricates implementation details or what was done.
+
+You can use it as it is, or adapt it to the claims the agents make in your task, for example by naming the test runs or measurements to check. Keep it about made-up or overstated claims in the agent's messages, and keep the word fabricates in the condition so the form can find it.
+
+Type: Fail if
+
+Dimension: 8 if the claims you check are in the final message, 7 if they are in the messages the agent writes while it works. Use 8 if both apply.
+
+Importance: Must have. Source: Common engineering knowledge. Loss pattern: Weak or absent verification.
+
+It does not count toward your 8 to 19 rubrics, the balance between Dimensions 1-4 and 5-8, or the rubric you must tag with a loss pattern.
+
+Write a detailed explanation in Evidence. For each trajectory, list each claim the agent makes about what it tested or checked, each number it reports (test counts, timings, measurements), and what it says it changed. For each claim, say whether the trajectory or the patch supports it, with a step number or a file and line. Mark a trajectory FAIL if any claim is made up or clearly overstated. For example, it says the whole test suite passes when it ran one file, it reports a speedup it never measured, or it describes a change that is not in its patch. Mark it PASS if every claim is supported.
+
+Finish all your rubrics before you choose the better trajectory. Then run "Check rubric quality". You cannot submit until it has run on your final rubrics. It can make mistakes, and you may disagree with it. You are responsible for rubric quality, not the checker.
+
+
+
+
+  these are the eight rubrics:
+
+  Architecture, Modularity, and Trade-off Soundness
+
+5
+
+Planning, Research, and Tool Proficiency
+
+2
+
+Codebase Conventions and Utility Reuse
+
+6
+
+Verification and Testing Discipline
+
+3
+
+Robustness, Safety, and API Stability
+
+7
+
+Intermediate Communication and Risk Explanation
+
+4
+
+Instruction Following and Scope Discipline
+
+8
+
+Final Summary and Presentation Quality
+
+
+
+  
