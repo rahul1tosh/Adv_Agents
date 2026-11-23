@@ -1,1 +1,13 @@
-Add the fabrication rubric (Step 7): a Must have Fail if on Dimension 7 or 8 whose condition includes the word fabricates. You can start from: The agent fabricates things: it over-claims testing and verification, fabricates metrics or numbers, or fabricates implementation details or what was done.
+Correctness rubrics: none (tests only).
+
+D1: INSUFFICIENT_EVIDENCE: neither Trajectory A nor Trajectory B has a cited location.
+D2: INSUFFICIENT_EVIDENCE: neither Trajectory A nor Trajectory B has a cited location.
+D3: INSUFFICIENT_EVIDENCE: neither Trajectory A nor Trajectory B has a cited location.
+D4: INSUFFICIENT_EVIDENCE: neither Trajectory A nor Trajectory B has a cited location.
+D5: FLAG D1, D5, E3: The condition checks subjective, unobservable agent deliberation, and the evidence relies on speculation without cited locations.
+D6: FLAG E2, E3: The evidence discusses test file additions rather than test commands run by the agent, and neither trajectory has a cited location.
+D7: FLAG D2, E3: If typed as Fail if, the condition describes desirable behavior rather than a failure, and neither trajectory has a cited location.
+D8: FLAG E2, E3: The evidence refers to patch contents rather than the agent's final response summary, and neither trajectory has a cited location.
+D9: FLAG E3: The evidence does not list the agent's claims regarding testing, checks, numbers, and changes with step numbers or patch locations to verify whether each claim is supported.
+
+Summary: 9 flagged
