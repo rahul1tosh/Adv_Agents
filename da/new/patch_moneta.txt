@@ -1,0 +1,1034 @@
+diff --git a/sqllineage/core/holders.py b/sqllineage/core/holders.py
+index b9a68c1..7bcdc58 100644
+--- a/sqllineage/core/holders.py
++++ b/sqllineage/core/holders.py
+@@ -194,11 +194,11 @@ class SubQueryLineageHolder(ColumnLineageMixin):
+                     tgt_tbl, tgt_col, EdgeType.HAS_COLUMN, **{EdgeTag.INDEX: idx}
+                 )
+ 
+-    def add_column_lineage(self, src: Column, tgt: Column) -> None:
++    def add_column_lineage(self, src: Column, tgt: Column, **props) -> None:
+         """
+         link source column to target.
+         """
+-        self.go.add_edge_if_not_exist(src, tgt, EdgeType.LINEAGE)
++        self.go.add_edge_if_not_exist(src, tgt, EdgeType.LINEAGE, **props)
+         self.go.add_edge_if_not_exist(tgt.parent, tgt, EdgeType.HAS_COLUMN)
+         self.go.add_edge_if_not_exist(src.parent, src, EdgeType.HAS_COLUMN)
+ 
+@@ -211,6 +211,25 @@ class SubQueryLineageHolder(ColumnLineageMixin):
+             if isinstance(edge.target, Column) and edge.target.raw_name != "*"
+         ]
+ 
++    def _resolve_wildcard_source_columns(
++        self,
++        src_wildcard: Column,
++        metadata_provider: MetaDataProvider,
++        resolve_cte: bool,
++    ) -> list[Column]:
++        src_table_columns: list[Column] = []
++        if source_table := src_wildcard.parent:
++            if isinstance(source_table, SubQuery):
++                # the columns of SubQuery can be inferred from graph
++                if self._has_known_columns(
++                    source_table, metadata_provider, resolve_cte
++                ):
++                    src_table_columns = self.get_table_columns(source_table)
++            elif isinstance(source_table, Table) and metadata_provider:
++                # search by metadata service
++                src_table_columns = metadata_provider.get_table_columns(source_table)
++        return src_table_columns
++
+     def expand_wildcard(
+         self,
+         metadata_provider: MetaDataProvider,
+@@ -223,37 +242,99 @@ class SubQueryLineageHolder(ColumnLineageMixin):
+             for column in self._get_ordered_columns(tgt_table):
+                 if column.raw_name == "*":
+                     tgt_wildcard = column
+-                    src_wildcards = self.get_source_columns(tgt_wildcard)
++                    in_edges = self.go.retrieve_edges_by_vertex(
++                        tgt_wildcard, EdgeDirection.IN, EdgeType.LINEAGE
++                    )
++                    src_wildcards = [
++                        e.source for e in in_edges if isinstance(e.source, Column)
++                    ]
++                    by_name_wildcards = {
++                        e.source
++                        for e in in_edges
++                        if isinstance(e.source, Column)
++                        and e.attributes.get(EdgeTag.BY_NAME)
++                    }
+                     # Enable positional mapping only for UNION-of-* into a real table; avoid join/subquery cases
+                     wildcard_in_union = (
+                         isinstance(tgt_table, Table)
+                         and len(self._get_ordered_columns(tgt_table)) == 1
+                         and len(src_wildcards) > 1
++                        and not by_name_wildcards
+                     )
+-                    for src_wildcard in src_wildcards:
+-                        if source_table := src_wildcard.parent:
+-                            src_table_columns = []
+-                            if isinstance(source_table, SubQuery):
+-                                # the columns of SubQuery can be inferred from graph
+-                                if self._has_known_columns(
+-                                    source_table, metadata_provider, resolve_cte
+-                                ):
+-                                    src_table_columns = self.get_table_columns(
+-                                        source_table
++                    tbl_col_edges = [
++                        e
++                        for e in self.go.retrieve_edges_by_vertex(
++                            tgt_table, EdgeDirection.OUT, EdgeType.HAS_COLUMN
++                        )
++                        if isinstance(e.target, Column) and e.target.raw_name != "*"
++                    ]
++                    has_explicit_write_columns = bool(tbl_col_edges) and all(
++                        EdgeTag.INDEX in e.attributes for e in tbl_col_edges
++                    )
++                    if (
++                        has_explicit_write_columns
++                        and by_name_wildcards
++                        and len(by_name_wildcards) == len(src_wildcards)
++                    ):
++                        resolved_groups = [
++                            self._resolve_wildcard_source_columns(
++                                sw, metadata_provider, resolve_cte
++                            )
++                            for sw in src_wildcards
++                        ]
++                        if all(resolved_groups):
++                            combined_by_name: dict[str, list[Column]] = {}
++                            for sw_cols in resolved_groups:
++                                if tgt_wildcard.except_columns:
++                                    sw_cols = [
++                                        c
++                                        for c in sw_cols
++                                        if c.raw_name not in tgt_wildcard.except_columns
++                                    ]
++                                for sc in sw_cols:
++                                    combined_by_name.setdefault(sc.raw_name, []).append(
++                                        sc
+                                     )
+-                            elif isinstance(source_table, Table) and metadata_provider:
+-                                # search by metadata service
+-                                src_table_columns = metadata_provider.get_table_columns(
+-                                    source_table
+-                                )
+-                            if src_table_columns:
+-                                self._replace_wildcard(
+-                                    tgt_table,
+-                                    src_table_columns,
+-                                    tgt_wildcard,
+-                                    src_wildcard,
+-                                    wildcard_in_union=wildcard_in_union,
+-                                )
++                            write_columns = [
++                                c
++                                for c in self._get_ordered_columns(tgt_table)
++                                if c.raw_name != "*"
++                            ]
++                            if len(combined_by_name) == len(write_columns):
++                                for idx, (_, src_cols) in enumerate(
++                                    combined_by_name.items()
++                                ):
++                                    target_col = write_columns[idx]
++                                    for src_col in src_cols:
++                                        if src_col.parent is not None:
++                                            self.go.add_edge_if_not_exist(
++                                                src_col.parent,
++                                                src_col,
++                                                EdgeType.HAS_COLUMN,
++                                            )
++                                        self.go.add_edge_if_not_exist(
++                                            src_col, target_col, EdgeType.LINEAGE
++                                        )
++                                if not isinstance(tgt_table, SubQuery):
++                                    self.go.drop_vertices(tgt_wildcard)
++                                    for sw in src_wildcards:
++                                        if sw.parent is not None and not isinstance(
++                                            sw.parent, SubQuery
++                                        ):
++                                            self.go.drop_vertices(sw)
++                                continue
++                    for src_wildcard in src_wildcards:
++                        if src_table_columns := self._resolve_wildcard_source_columns(
++                            src_wildcard, metadata_provider, resolve_cte
++                        ):
++                            self._replace_wildcard(
++                                tgt_table,
++                                src_table_columns,
++                                tgt_wildcard,
++                                src_wildcard,
++                                wildcard_in_union=wildcard_in_union,
++                                by_name=src_wildcard in by_name_wildcards,
++                            )
+ 
+     def get_alias_mapping_from_table_group(
+         self, table_group: list[Path | Table | SubQuery]
+@@ -330,6 +411,7 @@ class SubQueryLineageHolder(ColumnLineageMixin):
+         tgt_wildcard: Column,
+         src_wildcard: Column,
+         wildcard_in_union: bool = False,
++        by_name: bool = False,
+     ) -> None:
+         if tgt_wildcard.except_columns:
+             src_table_columns = [
+@@ -338,8 +420,8 @@ class SubQueryLineageHolder(ColumnLineageMixin):
+                 if c.raw_name not in tgt_wildcard.except_columns
+             ]
+         target_columns = self.get_table_columns(tgt_table)
+-        use_positional = wildcard_in_union or (
+-            len(target_columns) == len(src_table_columns)
++        use_positional = not by_name and (
++            wildcard_in_union or (len(target_columns) == len(src_table_columns))
+         )
+         for idx, src_col in enumerate(src_table_columns):
+             if use_positional and idx < len(target_columns):
+diff --git a/sqllineage/core/parser/__init__.py b/sqllineage/core/parser/__init__.py
+index 7e0ea30..42d450d 100644
+--- a/sqllineage/core/parser/__init__.py
++++ b/sqllineage/core/parser/__init__.py
+@@ -9,6 +9,47 @@ class SourceHandlerMixin:
+     columns: list[Column]
+     union_barriers: list[tuple[int, int]]
+ 
++    def _resolve_source_columns(
++        self,
++        tgt_col_from_query: Column,
++        alias_mapping: dict[str, Path | Table | SubQuery],
++        holder: SubQueryLineageHolder,
++        lateral_column_aliases: dict[str, list[Column]],
++    ) -> list[Column]:
++        src_cols_resolved: list[Column] = []
++        for src_col in tgt_col_from_query.to_source_columns(alias_mapping):
++            lca_flag = False
++            if SQLLineageConfig.LATERAL_COLUMN_ALIAS_REFERENCE:
++                if metadata_provider := getattr(self, "metadata_provider", None):
++                    from_dataset = False
++                    for parent_candidate in src_col.parent_candidates:
++                        if isinstance(
++                            parent_candidate, Table
++                        ) and src_col in metadata_provider.get_table_columns(
++                            parent_candidate
++                        ):
++                            from_dataset = True
++                        elif isinstance(
++                            parent_candidate, SubQuery
++                        ) and src_col in holder.get_table_columns(parent_candidate):
++                            from_dataset = True
++                    if not from_dataset and (
++                        lca_cols_resolved := lateral_column_aliases.get(
++                            src_col.raw_name, []
++                        )
++                    ):
++                        src_cols_resolved.extend(lca_cols_resolved)
++                        lca_flag = True
++            if not lca_flag:
++                src_cols_resolved.append(src_col)
++        if (
++            SQLLineageConfig.LATERAL_COLUMN_ALIAS_REFERENCE
++            and tgt_col_from_query.from_alias
++            and src_cols_resolved
++        ):
++            lateral_column_aliases[tgt_col_from_query.raw_name] = src_cols_resolved
++        return src_cols_resolved
++
+     def end_of_query_cleanup(self, holder: SubQueryLineageHolder) -> None:
+         for i, tbl in enumerate(self.tables):
+             holder.add_read(tbl)
+@@ -28,51 +69,21 @@ class SourceHandlerMixin:
+                 for idx, tgt_col_from_query in enumerate(col_grp):
+                     tgt_col_from_query.parent = tgt_tbl
+                     tgt_col_resolved = tgt_col_from_query
+-                    src_cols_resolved = []
+-                    for src_col in tgt_col_from_query.to_source_columns(alias_mapping):
+-                        if len(write_columns := holder.write_columns) == len(col_grp):
+-                            # example query: create view test (col3) select col1 as col2 from tab
+-                            # without write_columns = [col3] information, by default src_col = col1 and tgt_col = col2
+-                            # when write_columns exist and length matches, we want tgt_col = col3 instead of col2
+-                            # for invalid query: create view test (col3, col4) select col1 as col2 from tab,
+-                            # when the length doesn't match, we fall back to default behavior
+-                            tgt_col_resolved = write_columns[idx]
+-                        # lateral column alias handling
+-                        lca_flag = False
+-                        if SQLLineageConfig.LATERAL_COLUMN_ALIAS_REFERENCE:
+-                            if metadata_provider := getattr(
+-                                self, "metadata_provider", None
+-                            ):
+-                                from_dataset = False
+-                                for parent_candidate in src_col.parent_candidates:
+-                                    if isinstance(
+-                                        parent_candidate, Table
+-                                    ) and src_col in metadata_provider.get_table_columns(
+-                                        parent_candidate
+-                                    ):
+-                                        from_dataset = True
+-                                    elif isinstance(
+-                                        parent_candidate, SubQuery
+-                                    ) and src_col in holder.get_table_columns(
+-                                        parent_candidate
+-                                    ):
+-                                        from_dataset = True
+-                                if not from_dataset and (
+-                                    lca_cols_resolved := lateral_column_aliases.get(
+-                                        src_col.raw_name, []
+-                                    )
+-                                ):
+-                                    src_cols_resolved.extend(lca_cols_resolved)
+-                                    lca_flag = True
+-                        if not lca_flag:
+-                            src_cols_resolved.append(src_col)
++                    src_cols_resolved = self._resolve_source_columns(
++                        tgt_col_from_query,
++                        alias_mapping,
++                        holder,
++                        lateral_column_aliases,
++                    )
++                    if src_cols_resolved and len(
++                        write_columns := holder.write_columns
++                    ) == len(col_grp):
++                        # example query: create view test (col3) select col1 as col2 from tab
++                        # without write_columns = [col3] information, by default src_col = col1 and tgt_col = col2
++                        # when write_columns exist and length matches, we want tgt_col = col3 instead of col2
++                        # for invalid query: create view test (col3, col4) select col1 as col2 from tab,
++                        # when the length doesn't match, we fall back to default behavior
++                        tgt_col_resolved = write_columns[idx]
+ 
+                     for src_col_resolved in src_cols_resolved:
+                         holder.add_column_lineage(src_col_resolved, tgt_col_resolved)
+-                        if (
+-                            SQLLineageConfig.LATERAL_COLUMN_ALIAS_REFERENCE
+-                            and tgt_col_from_query.from_alias
+-                        ):
+-                            lateral_column_aliases[tgt_col_from_query.raw_name] = (
+-                                src_cols_resolved
+-                            )
+diff --git a/sqllineage/core/parser/sqlfluff/extractors/select.py b/sqllineage/core/parser/sqlfluff/extractors/select.py
+index dcd5840..7e5e4e1 100644
+--- a/sqllineage/core/parser/sqlfluff/extractors/select.py
++++ b/sqllineage/core/parser/sqlfluff/extractors/select.py
+@@ -1,7 +1,10 @@
++from dataclasses import dataclass, field
++
+ from sqlfluff.core.parser import BaseSegment
+ 
+ from sqllineage.core.holders import SubQueryLineageHolder
+ from sqllineage.core.metadata_provider import MetaDataProvider
++from sqllineage.core.models import Column, SubQuery
+ from sqllineage.core.parser import SourceHandlerMixin
+ from sqllineage.core.parser.sqlfluff.extractors.base import BaseExtractor
+ from sqllineage.core.parser.sqlfluff.models import (
+@@ -10,13 +13,38 @@ from sqllineage.core.parser.sqlfluff.models import (
+ )
+ from sqllineage.core.parser.sqlfluff.utils import (
+     find_table_identifier,
++    has_by_name_set_operator,
++    is_by_name_set_operator,
+     is_set_expression,
+     list_child_segments,
+ )
++from sqllineage.exceptions import SQLLineageException
++from sqllineage.utils.constant import EdgeTag
+ from sqllineage.utils.entities import AnalyzerContext
+ from sqllineage.utils.helpers import escape_identifier_name
+ 
+ 
++@dataclass
++class _SetLeaf:
++    col_start: int
++    col_end: int
++    tbl_start: int
++    tbl_end: int
++
++
++@dataclass
++class _SetExpr:
++    branches: list["_SetLeaf | _SetExpr"]
++    operators: list[bool]
++
++
++@dataclass
++class _CombinedColumn:
++    col: Column
++    src_cols: list[Column] = field(default_factory=list)
++    is_by_name_wildcard: bool = False
++
++
+ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+     """
+     Select statement lineage extractor
+@@ -29,6 +57,7 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+         self.columns = []
+         self.tables = []
+         self.union_barriers = []
++        self._set_expr_tree: _SetExpr | None = None
+ 
+     def extract(
+         self,
+@@ -115,9 +144,174 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+                 if table := self.find_table(identifier):
+                     holder.add_write(table)
+ 
++    def end_of_query_cleanup(self, holder: SubQueryLineageHolder) -> None:
++        if self._set_expr_tree is None:
++            super().end_of_query_cleanup(holder)
++            return
++        for tbl in self.tables:
++            holder.add_read(tbl)
++        if holder.write:
++            if len(holder.write) > 1:
++                raise SQLLineageException
++            tgt_tbl = next(iter(holder.write))
++            combined = self._evaluate_set_node(self._set_expr_tree, holder)
++            write_columns = holder.write_columns
++            use_write_columns = len(write_columns) == len(combined)
++            for idx, entry in enumerate(combined):
++                if use_write_columns:
++                    tgt_col_resolved = write_columns[idx]
++                else:
++                    tgt_col_resolved = entry.col
++                    tgt_col_resolved.parent = tgt_tbl
++                props = {EdgeTag.BY_NAME: True} if entry.is_by_name_wildcard else {}
++                for src_col_resolved in entry.src_cols:
++                    holder.add_column_lineage(
++                        src_col_resolved, tgt_col_resolved, **props
++                    )
++
++    def _build_set_expression_tree(
++        self, segment: BaseSegment, holder: SubQueryLineageHolder
++    ) -> _SetExpr:
++        branches: list[_SetLeaf | _SetExpr] = []
++        operators: list[bool] = []
++        for child in segment.get_children(
++            "select_statement", "bracketed", "set_operator", "values_clause"
++        ):
++            match child.type:
++                case "set_operator":
++                    operators.append(is_by_name_set_operator(child))
++                case "select_statement":
++                    col_start, tbl_start = len(self.columns), len(self.tables)
++                    for seg in list_child_segments(child):
++                        self._handle_select_statement_child_segments(seg, holder)
++                    branches.append(
++                        _SetLeaf(
++                            col_start,
++                            len(self.columns),
++                            tbl_start,
++                            len(self.tables),
++                        )
++                    )
++                case "values_clause":
++                    col_len, tbl_len = len(self.columns), len(self.tables)
++                    branches.append(_SetLeaf(col_len, col_len, tbl_len, tbl_len))
++                case "bracketed":
++                    inner_children = list_child_segments(child)
++                    if any(c.type == "set_expression" for c in inner_children):
++                        for c in inner_children:
++                            if c.type == "set_expression":
++                                branches.append(
++                                    self._build_set_expression_tree(c, holder)
++                                )
++                    else:
++                        col_start, tbl_start = len(self.columns), len(self.tables)
++                        for seg in inner_children:
++                            if seg.type == "select_statement":
++                                for sub_seg in list_child_segments(seg):
++                                    self._handle_select_statement_child_segments(
++                                        sub_seg, holder
++                                    )
++                            else:
++                                self._handle_select_statement_child_segments(
++                                    seg, holder
++                                )
++                        branches.append(
++                            _SetLeaf(
++                                col_start,
++                                len(self.columns),
++                                tbl_start,
++                                len(self.tables),
++                            )
++                        )
++        return _SetExpr(branches=branches, operators=operators)
++
++    def _evaluate_set_leaf(
++        self, leaf: _SetLeaf, holder: SubQueryLineageHolder
++    ) -> list[_CombinedColumn]:
++        col_grp = self.columns[leaf.col_start : leaf.col_end]
++        tbl_grp = self.tables[leaf.tbl_start : leaf.tbl_end]
++        alias_mapping = holder.get_alias_mapping_from_table_group(tbl_grp)
++        lateral_column_aliases: dict[str, list[Column]] = {}
++        result: list[_CombinedColumn] = []
++        for tgt_col_from_query in col_grp:
++            src_cols_resolved = self._resolve_source_columns(
++                tgt_col_from_query, alias_mapping, holder, lateral_column_aliases
++            )
++            if (
++                tgt_col_from_query.raw_name == "*"
++                and len(src_cols_resolved) == 1
++                and (
++                    expanded := holder._resolve_wildcard_source_columns(
++                        src_cols_resolved[0],
++                        self.metadata_provider,
++                        resolve_cte=False,
++                    )
++                )
++            ):
++                if tgt_col_from_query.except_columns:
++                    expanded = [
++                        c
++                        for c in expanded
++                        if c.raw_name not in tgt_col_from_query.except_columns
++                    ]
++                for src_col in expanded:
++                    result.append(
++                        _CombinedColumn(
++                            Column(src_col.raw_name, escaped=True), [src_col]
++                        )
++                    )
++            else:
++                result.append(_CombinedColumn(tgt_col_from_query, src_cols_resolved))
++        return result
++
++    def _evaluate_set_node(
++        self, node: _SetLeaf | _SetExpr, holder: SubQueryLineageHolder
++    ) -> list[_CombinedColumn]:
++        if isinstance(node, _SetLeaf):
++            return self._evaluate_set_leaf(node, holder)
++        combined = self._evaluate_set_node(node.branches[0], holder)
++        for by_name, branch in zip(node.operators, node.branches[1:]):
++            right = self._evaluate_set_node(branch, holder)
++            if by_name:
++                by_name_map: dict[str, _CombinedColumn] = {}
++                for entry in combined:
++                    if entry.col.raw_name == "*":
++                        entry.is_by_name_wildcard = True
++                    by_name_map.setdefault(entry.col.raw_name, entry)
++                for item in right:
++                    if item.col.raw_name == "*":
++                        item.is_by_name_wildcard = True
++                    if existing := by_name_map.get(item.col.raw_name):
++                        existing.src_cols.extend(item.src_cols)
++                        if item.is_by_name_wildcard:
++                            existing.is_by_name_wildcard = True
++                    else:
++                        combined.append(item)
++                        by_name_map[item.col.raw_name] = item
++            else:
++                for idx, item in enumerate(right):
++                    if idx < len(combined):
++                        combined[idx].src_cols.extend(item.src_cols)
++                        if item.is_by_name_wildcard:
++                            combined[idx].is_by_name_wildcard = True
++                    else:
++                        combined.append(item)
++        return combined
++
+     def _handle_set_expression(
+         self, segment: BaseSegment, holder: SubQueryLineageHolder
+     ) -> None:
++        set_expr = (
++            segment
++            if segment.type == "set_expression"
++            else next(
++                (s for s in segment.segments if s.type == "set_expression"),
++                None,
++            )
++        )
++        if set_expr is not None and has_by_name_set_operator(set_expr):
++            self._set_expr_tree = self._build_set_expression_tree(set_expr, holder)
++            return
+         # Recursively handle set_expression and nested bracketed set_expressions
+         for idx, child in enumerate(
+             segment.get_children("select_statement", "bracketed")
+@@ -139,9 +333,21 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+                         for seg in inner_children:
+                             self._handle_select_statement_child_segments(seg, holder)
+ 
+-    def _collect_subqueries_in_set_expression(self, segment: BaseSegment):
+-        subqueries = []
+-        for child in segment.get_children("select_statement", "bracketed"):
++    def _collect_subqueries_in_set_expression(
++        self, segment: BaseSegment
++    ) -> list[SubQuery]:
++        subqueries: list[SubQuery] = []
++        set_expr = (
++            segment
++            if segment.type == "set_expression"
++            else next(
++                (s for s in segment.segments if s.type == "set_expression"),
++                None,
++            )
++        )
++        if set_expr is None:
++            return subqueries
++        for child in set_expr.get_children("select_statement", "bracketed"):
+             match child.type:
+                 case "select_statement":
+                     for seg in list_child_segments(child):
+@@ -153,6 +359,9 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+                             subqueries.extend(
+                                 self._collect_subqueries_in_set_expression(c)
+                             )
++                        elif c.type == "select_statement":
++                            for seg in list_child_segments(c):
++                                subqueries.extend(self.list_subquery(seg))
+                         else:
+                             subqueries.extend(self.list_subquery(c))
+         return subqueries
+diff --git a/sqllineage/core/parser/sqlfluff/utils.py b/sqllineage/core/parser/sqlfluff/utils.py
+index a054923..5db06ab 100644
+--- a/sqllineage/core/parser/sqlfluff/utils.py
++++ b/sqllineage/core/parser/sqlfluff/utils.py
+@@ -29,6 +29,29 @@ def is_set_expression(segment: BaseSegment) -> bool:
+     )
+ 
+ 
++def is_by_name_set_operator(segment: BaseSegment) -> bool:
++    if segment.type != "set_operator":
++        return False
++    keywords = [seg.raw_upper for seg in segment.segments if seg.type == "keyword"]
++    if "CORRESPONDING" in keywords:
++        return True
++    return any(
++        keywords[i] == "BY" and keywords[i + 1] == "NAME"
++        for i in range(len(keywords) - 1)
++    )
++
++
++def has_by_name_set_operator(segment: BaseSegment) -> bool:
++    for child in segment.get_children("set_operator", "bracketed"):
++        if child.type == "set_operator" and is_by_name_set_operator(child):
++            return True
++        elif child.type == "bracketed":
++            for inner in list_child_segments(child):
++                if inner.type == "set_expression" and has_by_name_set_operator(inner):
++                    return True
++    return False
++
++
+ def is_subquery(segment: BaseSegment) -> bool:
+     if segment.type in ["from_expression_element", "bracketed"]:
+         token = extract_innermost_bracketed(
+diff --git a/sqllineage/utils/constant.py b/sqllineage/utils/constant.py
+index 08ac093..b52befb 100644
+--- a/sqllineage/utils/constant.py
++++ b/sqllineage/utils/constant.py
+@@ -10,6 +10,7 @@ class NodeTag:
+ 
+ class EdgeTag:
+     INDEX = "index"
++    BY_NAME = "by_name"
+ 
+ 
+ class EdgeType:
+diff --git a/tests/sql/column/test_column_select_union_dialect_specific.py b/tests/sql/column/test_column_select_union_dialect_specific.py
+new file mode 100644
+index 0000000..7a1e012
+--- /dev/null
++++ b/tests/sql/column/test_column_select_union_dialect_specific.py
+@@ -0,0 +1,404 @@
++import pytest
++
++from sqllineage.core.metadata_provider import MetaDataProvider
++from sqllineage.utils.entities import ColumnQualifierTuple
++
++from ...helpers import assert_column_lineage_equal, generate_metadata_providers
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("snowflake", "UNION BY NAME"),
++        ("snowflake", "UNION DISTINCT BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("duckdb", "UNION BY NAME"),
++        ("duckdb", "UNION DISTINCT BY NAME"),
++        ("bigquery", "UNION ALL BY NAME"),
++        ("bigquery", "UNION DISTINCT BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++        ("bigquery", "UNION DISTINCT CORRESPONDING"),
++    ],
++)
++def test_union_by_name_basic(dialect: str, operator: str):
++    sql = f"""INSERT INTO tgt
++SELECT a, b FROM t1
++{operator}
++SELECT b, a FROM t2"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("b", "t2"), ColumnQualifierTuple("b", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
++def test_plain_union_keeps_positional_matching(dialect: str):
++    sql = """INSERT INTO tgt
++SELECT a, b FROM t1
++UNION ALL
++SELECT b, a FROM t2"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("b", "t2"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("b", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_with_aliases_and_expressions(dialect: str, operator: str):
++    sql = f"""INSERT INTO tgt
++SELECT t1.col1, col2 + 1 AS col3 FROM t1
++{operator}
++SELECT t2.col4 AS col3, col5 AS col1 FROM t2"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("col1", "t1"), ColumnQualifierTuple("col1", "tgt")),
++            (ColumnQualifierTuple("col5", "t2"), ColumnQualifierTuple("col1", "tgt")),
++            (ColumnQualifierTuple("col2", "t1"), ColumnQualifierTuple("col3", "tgt")),
++            (ColumnQualifierTuple("col4", "t2"), ColumnQualifierTuple("col3", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_different_columns_multiple_branches(dialect: str, operator: str):
++    sql = f"""INSERT INTO tgt
++SELECT a, b FROM t1
++{operator}
++SELECT c, a FROM t2
++{operator}
++SELECT d, b, e FROM t3"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("b", "t3"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("c", "tgt")),
++            (ColumnQualifierTuple("d", "t3"), ColumnQualifierTuple("d", "tgt")),
++            (ColumnQualifierTuple("e", "t3"), ColumnQualifierTuple("e", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_with_target_columns(dialect: str, operator: str):
++    sql = f"""INSERT INTO tgt (x, y, z)
++SELECT a, b FROM t1
++{operator}
++SELECT c, a FROM t2"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("y", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("z", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_with_literal_placeholder_and_target_columns(
++    dialect: str, operator: str
++):
++    sql = f"""INSERT INTO tgt (x, y, z)
++SELECT a, 1 AS b FROM t1
++{operator}
++SELECT c, b, a FROM t2"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("b", "t2"), ColumnQualifierTuple("y", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("z", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_inside_subquery(dialect: str, operator: str):
++    sql = f"""INSERT INTO tgt
++SELECT sq.a, sq.b, sq.c
++FROM (
++    SELECT a, b FROM t1
++    {operator}
++    SELECT c, a FROM t2
++) sq"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("c", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_inside_subquery_with_wildcard_and_cte(
++    dialect: str, operator: str
++):
++    sql = f"""WITH u AS (
++    SELECT a, b FROM t1
++    {operator}
++    SELECT c, a FROM t2
++)
++INSERT INTO tgt
++SELECT * FROM u"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("c", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize("dialect", ["snowflake", "duckdb"])
++def test_union_by_name_inside_subquery_with_column_alias_list(dialect: str):
++    sql = """INSERT INTO tgt
++SELECT sq.x, sq.y, sq.z
++FROM (
++    SELECT a, b FROM t1
++    UNION ALL BY NAME
++    SELECT c, a FROM t2
++) AS sq (x, y, z)"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("y", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("z", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_nested_parenthesized_union_by_name_and_positional(dialect: str, operator: str):
++    sql = f"""INSERT INTO tgt
++(SELECT a, b FROM t1 {operator} SELECT c, a FROM t2)
++UNION ALL
++SELECT x, y, z FROM t3"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("x", "t3"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("y", "t3"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("c", "tgt")),
++            (ColumnQualifierTuple("z", "t3"), ColumnQualifierTuple("c", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++    sql_right = f"""INSERT INTO tgt
++SELECT x, y, z FROM t3
++UNION ALL
++(SELECT a, b FROM t1 {operator} SELECT c, a FROM t2)"""
++    assert_column_lineage_equal(
++        sql_right,
++        [
++            (ColumnQualifierTuple("x", "t3"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("y", "t3"), ColumnQualifierTuple("y", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("y", "tgt")),
++            (ColumnQualifierTuple("z", "t3"), ColumnQualifierTuple("z", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("z", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "provider",
++    generate_metadata_providers(
++        {
++            "db.t1": ["a", "b"],
++            "db.t2": ["c", "a"],
++        }
++    ),
++    ids=["dummy", "sqlalchemy"],
++)
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_wildcard_with_metadata(
++    provider: MetaDataProvider, dialect: str, operator: str
++):
++    sql = f"""INSERT INTO db.tgt
++SELECT * FROM db.t1
++{operator}
++SELECT * FROM db.t2"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "db.t1"), ColumnQualifierTuple("a", "db.tgt")),
++            (ColumnQualifierTuple("a", "db.t2"), ColumnQualifierTuple("a", "db.tgt")),
++            (ColumnQualifierTuple("b", "db.t1"), ColumnQualifierTuple("b", "db.tgt")),
++            (ColumnQualifierTuple("c", "db.t2"), ColumnQualifierTuple("c", "db.tgt")),
++        ],
++        dialect=dialect,
++        metadata_provider=provider,
++        test_sqlparse=False,
++    )
++
++    sql_with_target = f"""INSERT INTO db.tgt (x, y, z)
++SELECT * FROM db.t1
++{operator}
++SELECT * FROM db.t2"""
++    assert_column_lineage_equal(
++        sql_with_target,
++        [
++            (ColumnQualifierTuple("a", "db.t1"), ColumnQualifierTuple("x", "db.tgt")),
++            (ColumnQualifierTuple("a", "db.t2"), ColumnQualifierTuple("x", "db.tgt")),
++            (ColumnQualifierTuple("b", "db.t1"), ColumnQualifierTuple("y", "db.tgt")),
++            (ColumnQualifierTuple("c", "db.t2"), ColumnQualifierTuple("z", "db.tgt")),
++        ],
++        dialect=dialect,
++        metadata_provider=provider,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "dialect, operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_wildcard_from_ctes(dialect: str, operator: str):
++    sql = f"""WITH cte1 AS (SELECT a, b FROM t1),
++cte2 AS (SELECT c, a FROM t2)
++INSERT INTO tgt
++SELECT * FROM cte1
++{operator}
++SELECT * FROM cte2"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("a", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("b", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("c", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++    sql_with_target = f"""WITH cte1 AS (SELECT a, b FROM t1),
++cte2 AS (SELECT c, a FROM t2)
++INSERT INTO tgt (x, y, z)
++SELECT * FROM cte1
++{operator}
++SELECT * FROM cte2"""
++    assert_column_lineage_equal(
++        sql_with_target,
++        [
++            (ColumnQualifierTuple("a", "t1"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("a", "t2"), ColumnQualifierTuple("x", "tgt")),
++            (ColumnQualifierTuple("b", "t1"), ColumnQualifierTuple("y", "tgt")),
++            (ColumnQualifierTuple("c", "t2"), ColumnQualifierTuple("z", "tgt")),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
