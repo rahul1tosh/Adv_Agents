@@ -1,271 +1,248 @@
-diff --git a/sqllineage/core/parser/__init__.py b/sqllineage/core/parser/__init__.py
-index 7e0ea30..d37d9ff 100644
---- a/sqllineage/core/parser/__init__.py
-+++ b/sqllineage/core/parser/__init__.py
-@@ -9,10 +9,63 @@ class SourceHandlerMixin:
-     columns: list[Column]
-     union_barriers: list[tuple[int, int]]
+diff --git a/pgvector/vector.py b/pgvector/vector.py
+index d86cba0..b82ed35 100644
+--- a/pgvector/vector.py
++++ b/pgvector/vector.py
+@@ -1,13 +1,20 @@
+ from __future__ import annotations
+ from array import array
++import math
+ import struct
+ import sys
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Callable
+ from ._utils import is_ndarray, ndarray
++from .bit import Bit
  
-+    def _column_groups(self) -> list[list[Column]]:
-+        groups = []
-+        prev_col_barrier = 0
-+        for col_barrier, _ in self.union_barriers:
-+            groups.append(self.columns[prev_col_barrier:col_barrier])
-+            prev_col_barrier = col_barrier
-+        return groups
-+
-+    def _resolve_by_name_slots(
-+        self, by_name_groups: set[int]
-+    ) -> tuple[list[list[int]], list[Column]]:
-+        """
-+        For set operations combining queries by column name (UNION [ALL] BY NAME, UNION ALL CORRESPONDING),
-+        compute the result column slot for each column in each query group, and the first column of each slot.
-+        Groups not in by_name_groups are combined by position.
-+        """
-+        slots: list[list[int]] = []
-+        slot_columns: list[Column] = []
-+        slot_names: list[str] = []
-+        for i, col_grp in enumerate(self._column_groups()):
-+            grp_slots = []
-+            for idx, col in enumerate(col_grp):
-+                if i == 0 or i in by_name_groups:
-+                    if col.raw_name in slot_names:
-+                        slot = slot_names.index(col.raw_name)
-+                    else:
-+                        slot = len(slot_names)
-+                        slot_names.append(col.raw_name)
-+                        slot_columns.append(col)
-+                else:
-+                    slot = idx
-+                grp_slots.append(slot)
-+            slots.append(grp_slots)
-+        return slots, slot_columns
-+
-     def end_of_query_cleanup(self, holder: SubQueryLineageHolder) -> None:
-         for i, tbl in enumerate(self.tables):
-             holder.add_read(tbl)
-         self.union_barriers.append((len(self.columns), len(self.tables)))
-+        by_name_groups = {
-+            i + 1
-+            for i, by_name in enumerate(getattr(self, "union_by_name", []))
-+            if by_name
-+        }
-+        by_name_slots: list[list[int]] = []
-+        slot_targets: list[Column] = []
-+        if by_name_groups:
-+            by_name_slots, slot_targets = self._resolve_by_name_slots(by_name_groups)
-+            if holder.write:
-+                if len(holder.write) > 1:
-+                    raise SQLLineageException
-+                tgt_tbl = next(iter(holder.write))
-+                if len(write_columns := holder.write_columns) == len(slot_targets):
-+                    slot_targets = write_columns
-+                else:
-+                    for col in slot_targets:
-+                        col.parent = tgt_tbl
-         for i, (col_barrier, tbl_barrier) in enumerate(self.union_barriers):
-             prev_col_barrier, prev_tbl_barrier = (
-                 (0, 0) if i == 0 else self.union_barriers[i - 1]
-@@ -30,7 +83,11 @@ class SourceHandlerMixin:
-                     tgt_col_resolved = tgt_col_from_query
-                     src_cols_resolved = []
-                     for src_col in tgt_col_from_query.to_source_columns(alias_mapping):
--                        if len(write_columns := holder.write_columns) == len(col_grp):
-+                        if by_name_groups:
-+                            slot = by_name_slots[i][idx]
-+                            if slot < len(slot_targets):
-+                                tgt_col_resolved = slot_targets[slot]
-+                        elif len(write_columns := holder.write_columns) == len(col_grp):
-                             # example query: create view test (col3) select col1 as col2 from tab
-                             # without write_columns = [col3] information, by default src_col = col1 and tgt_col = col2
-                             # when write_columns exist and length matches, we want tgt_col = col3 instead of col2
-diff --git a/sqllineage/core/parser/sqlfluff/extractors/select.py b/sqllineage/core/parser/sqlfluff/extractors/select.py
-index dcd5840..e1bad79 100644
---- a/sqllineage/core/parser/sqlfluff/extractors/select.py
-+++ b/sqllineage/core/parser/sqlfluff/extractors/select.py
-@@ -10,6 +10,7 @@ from sqllineage.core.parser.sqlfluff.models import (
- )
- from sqllineage.core.parser.sqlfluff.utils import (
-     find_table_identifier,
-+    is_by_name_set_operator,
-     is_set_expression,
-     list_child_segments,
- )
-@@ -29,6 +30,7 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
-         self.columns = []
-         self.tables = []
-         self.union_barriers = []
-+        self.union_by_name: list[bool] = []
+ if TYPE_CHECKING:
+     import numpy as np
  
-     def extract(
-         self,
-@@ -119,11 +121,16 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
-         self, segment: BaseSegment, holder: SubQueryLineageHolder
-     ) -> None:
-         # Recursively handle set_expression and nested bracketed set_expressions
-+        by_name = False
-         for idx, child in enumerate(
--            segment.get_children("select_statement", "bracketed")
-+            segment.get_children("select_statement", "bracketed", "set_operator")
-         ):
-+            if child.type == "set_operator":
-+                by_name = is_by_name_set_operator(child)
-+                continue
-             if idx != 0:
-                 self.union_barriers.append((len(self.columns), len(self.tables)))
-+                self.union_by_name.append(by_name)
-             match child.type:
-                 case "select_statement":
-                     for seg in list_child_segments(child):
-diff --git a/sqllineage/core/parser/sqlfluff/utils.py b/sqllineage/core/parser/sqlfluff/utils.py
-index a054923..f61d5d2 100644
---- a/sqllineage/core/parser/sqlfluff/utils.py
-+++ b/sqllineage/core/parser/sqlfluff/utils.py
-@@ -23,6 +23,15 @@ def is_negligible(segment: BaseSegment) -> bool:
-     )
++MAX_DIM = 16000
++
++# smallest magnitude that rounds to infinity as float32
++_FLOAT32_OVERFLOW = 2.0 ** 128 - 2.0 ** 103
++
  
+ class Vector:
+     _value: array[float]
+@@ -38,6 +45,87 @@ class Vector:
+             return NotImplemented
+         return self._value == other._value
  
-+def is_by_name_set_operator(segment: BaseSegment) -> bool:
-+    """
-+    Check if a set_operator combines queries by column name instead of by position, like:
-+    UNION [ALL] BY NAME (Snowflake, DuckDB, BigQuery) or UNION ALL CORRESPONDING (BigQuery)
-+    """
-+    keywords = [kw.raw_upper for kw in segment.get_children("keyword")]
-+    return "CORRESPONDING" in keywords or ("BY" in keywords and "NAME" in keywords)
++    def __add__(self, other: Vector, /) -> Vector:
++        if not isinstance(other, Vector):
++            return NotImplemented
++        return self._elementwise(other, lambda x, y: x + y, False)
 +
++    def __sub__(self, other: Vector, /) -> Vector:
++        if not isinstance(other, Vector):
++            return NotImplemented
++        return self._elementwise(other, lambda x, y: x - y, False)
 +
- def is_set_expression(segment: BaseSegment) -> bool:
-     return segment.type == "set_expression" or any(
-         seg.type == "set_expression" for seg in segment.segments
-diff --git a/tests/sql/column/test_column_select_union_by_name_dialect_specific.py b/tests/sql/column/test_column_select_union_by_name_dialect_specific.py
-new file mode 100644
-index 0000000..874bb76
---- /dev/null
-+++ b/tests/sql/column/test_column_select_union_by_name_dialect_specific.py
-@@ -0,0 +1,126 @@
-+import pytest
++    def __mul__(self, other: Vector, /) -> Vector:
++        if not isinstance(other, Vector):
++            return NotImplemented
++        return self._elementwise(other, lambda x, y: x * y, True)
 +
-+from sqllineage.utils.entities import ColumnQualifierTuple
++    def concat(self, other: Vector, /) -> Vector:
++        if not isinstance(other, Vector):
++            raise TypeError('expected Vector')
++        if len(self._value) + len(other._value) > MAX_DIM:
++            raise ValueError(f'vector cannot have more than {MAX_DIM} dimensions')
++        return self._from_array(self._value + other._value)
 +
-+from ...helpers import assert_column_lineage_equal
++    def l2_normalize(self) -> Vector:
++        norm = 0.0
++        for v in self._value:
++            norm += v * v
++        norm = math.sqrt(norm)
 +
++        if norm == 0:
++            return self._from_array(array('f', [0.0]) * len(self._value))
 +
-+def _lineage(*pairs: tuple[str, str, str, str]):
-+    return [
-+        (ColumnQualifierTuple(src_col, src_tbl), ColumnQualifierTuple(tgt_col, tgt_tbl))
-+        for src_col, src_tbl, tgt_col, tgt_tbl in pairs
-+    ]
++        result = [v / norm for v in self._value]
++        for r in result:
++            if abs(r) >= _FLOAT32_OVERFLOW:
++                raise ValueError('value out of range')
++        return self._from_array(array('f', result))
 +
++    def binary_quantize(self) -> Bit:
++        return Bit([v > 0 for v in self._value])
 +
-+@pytest.mark.parametrize(
-+    "dialect,set_operator",
-+    [
-+        ("snowflake", "UNION ALL BY NAME"),
-+        ("snowflake", "UNION BY NAME"),
-+        ("duckdb", "UNION ALL BY NAME"),
-+        ("duckdb", "UNION BY NAME"),
-+        ("bigquery", "UNION ALL BY NAME"),
-+        ("bigquery", "UNION ALL CORRESPONDING"),
-+    ],
-+)
-+def test_union_by_name_matches_columns_by_name(dialect: str, set_operator: str):
-+    sql = f"""INSERT INTO tgt
-+SELECT a, b FROM t1
-+{set_operator}
-+SELECT b, a FROM t2"""
-+    assert_column_lineage_equal(
-+        sql,
-+        _lineage(
-+            ("a", "t1", "a", "tgt"),
-+            ("a", "t2", "a", "tgt"),
-+            ("b", "t1", "b", "tgt"),
-+            ("b", "t2", "b", "tgt"),
-+        ),
-+        dialect=dialect,
-+        test_sqlparse=False,
-+    )
++    def subvector(self, start: int, count: int, /) -> Vector:
++        dim = len(self._value)
 +
++        if count < 1:
++            raise ValueError('vector must have at least 1 dimension')
 +
-+@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
-+def test_union_by_name_with_alias_and_new_columns(dialect: str):
-+    sql = """INSERT INTO tgt
-+SELECT a, col2 AS b FROM t1
-+UNION ALL BY NAME
-+SELECT c, b, a FROM t2
-+UNION ALL BY NAME
-+SELECT d, col2 AS c FROM t3"""
-+    assert_column_lineage_equal(
-+        sql,
-+        _lineage(
-+            ("a", "t1", "a", "tgt"),
-+            ("a", "t2", "a", "tgt"),
-+            ("col2", "t1", "b", "tgt"),
-+            ("b", "t2", "b", "tgt"),
-+            ("c", "t2", "c", "tgt"),
-+            ("col2", "t3", "c", "tgt"),
-+            ("d", "t3", "d", "tgt"),
-+        ),
-+        dialect=dialect,
-+        test_sqlparse=False,
-+    )
++        end = min(start + count, dim + 1)
 +
++        if start < 1:
++            start = 1
++        elif start > dim:
++            raise ValueError('vector must have at least 1 dimension')
 +
-+@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
-+def test_union_by_name_with_target_columns(dialect: str):
-+    sql = """INSERT INTO tgt (x, y, z)
-+SELECT a, b FROM t1
-+UNION ALL BY NAME
-+SELECT c, b, a FROM t2"""
-+    assert_column_lineage_equal(
-+        sql,
-+        _lineage(
-+            ("a", "t1", "x", "tgt"),
-+            ("a", "t2", "x", "tgt"),
-+            ("b", "t1", "y", "tgt"),
-+            ("b", "t2", "y", "tgt"),
-+            ("c", "t2", "z", "tgt"),
-+        ),
-+        dialect=dialect,
-+        test_sqlparse=False,
-+    )
++        if end - start < 1:
++            raise ValueError('vector must have at least 1 dimension')
 +
++        return self._from_array(self._value[start - 1:end - 1])
 +
-+@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
-+def test_union_by_name_in_subquery(dialect: str):
-+    sql = """INSERT INTO tgt
-+SELECT a, b, c FROM (
-+    SELECT a, b FROM t1
-+    UNION ALL BY NAME
-+    SELECT c, b, a FROM t2
-+) sq"""
-+    assert_column_lineage_equal(
-+        sql,
-+        _lineage(
-+            ("a", "t1", "a", "tgt"),
-+            ("a", "t2", "a", "tgt"),
-+            ("b", "t1", "b", "tgt"),
-+            ("b", "t2", "b", "tgt"),
-+            ("c", "t2", "c", "tgt"),
-+        ),
-+        dialect=dialect,
-+        test_sqlparse=False,
-+    )
++    def _elementwise(self, other: Vector, op: Callable[[float, float], float], check_underflow: bool) -> Vector:
++        a = self._value
++        b = other._value
++        if len(a) != len(b):
++            raise ValueError(f'different vector dimensions {len(a)} and {len(b)}')
 +
++        arr = array('f')
++        for x, y in zip(a, b):
++            r = op(x, y)
++            if abs(r) >= _FLOAT32_OVERFLOW:
++                raise ValueError('value out of range')
++            arr.append(r)
++            if check_underflow and arr[-1] == 0 and x != 0 and y != 0:
++                raise ValueError('value out of range: underflow')
 +
-+@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
-+def test_plain_union_all_still_matches_by_position(dialect: str):
-+    sql = """INSERT INTO tgt
-+SELECT a, b FROM t1
-+UNION ALL
-+SELECT b, a FROM t2"""
-+    assert_column_lineage_equal(
-+        sql,
-+        _lineage(
-+            ("a", "t1", "a", "tgt"),
-+            ("b", "t2", "a", "tgt"),
-+            ("b", "t1", "b", "tgt"),
-+            ("a", "t2", "b", "tgt"),
-+        ),
-+        dialect=dialect,
-+        test_sqlparse=False,
-+    )
++        return self._from_array(arr)
++
++    @classmethod
++    def _from_array(cls, value: array[float], /) -> Vector:
++        vec = cls.__new__(cls)
++        vec._value = value
++        return vec
++
+     def dimensions(self) -> int:
+         return len(self._value)
+ 
+diff --git a/tests/test_vector.py b/tests/test_vector.py
+index 13a9cc7..ea1a7f6 100644
+--- a/tests/test_vector.py
++++ b/tests/test_vector.py
+@@ -1,4 +1,4 @@
+-from pgvector import Vector
++from pgvector import Bit, Vector
+ import pytest
+ import struct
+ from .conftest import numpy as np
+@@ -136,3 +136,123 @@ class TestVector:
+     def test_from_binary_non_zero_unused(self) -> None:
+         with pytest.raises(ValueError, match='expected unused to be 0'):
+             Vector.from_binary(struct.pack('>hh', 0, 1))
++
++    def test_add(self) -> None:
++        a = Vector([1, 2, 3])
++        b = Vector([4, 5, 6])
++        assert a + b == Vector([5, 7, 9])
++        assert a.to_list() == [1, 2, 3]
++        assert b.to_list() == [4, 5, 6]
++
++    def test_add_float32(self) -> None:
++        assert (Vector([1]) + Vector([1e-8])).to_list() == [1]
++
++    def test_add_different_dimensions(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1, 2, 3]) + Vector([1, 2])
++        assert str(error.value) == 'different vector dimensions 3 and 2'
++
++    def test_add_overflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([3e38]) + Vector([3e38])
++        assert str(error.value) == 'value out of range'
++
++    def test_add_max(self) -> None:
++        assert (Vector([3.4028234663852886e38]) + Vector([2.0 ** 102])).to_list() == [3.4028234663852886e38]
++        with pytest.raises(ValueError, match='value out of range'):
++            Vector([3.4028234663852886e38]) + Vector([2.0 ** 103])
++
++    def test_add_non_vector(self) -> None:
++        with pytest.raises(TypeError):
++            Vector([1]) + [1]  # type: ignore
++
++    def test_subtract(self) -> None:
++        assert Vector([1, 2, 3]) - Vector([4, 5, 6]) == Vector([-3, -3, -3])
++
++    def test_subtract_different_dimensions(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1, 2]) - Vector([1, 2, 3])
++        assert str(error.value) == 'different vector dimensions 2 and 3'
++
++    def test_subtract_overflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([-3e38]) - Vector([3e38])
++        assert str(error.value) == 'value out of range'
++
++    def test_subtract_non_vector(self) -> None:
++        with pytest.raises(TypeError):
++            Vector([1]) - 1  # type: ignore
++
++    def test_multiply(self) -> None:
++        assert Vector([1, 2, 3]) * Vector([4, 5, 6]) == Vector([4, 10, 18])
++
++    def test_multiply_different_dimensions(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1, 2, 3]) * Vector([1, 2])
++        assert str(error.value) == 'different vector dimensions 3 and 2'
++
++    def test_multiply_overflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1e20]) * Vector([1e20])
++        assert str(error.value) == 'value out of range'
++
++    def test_multiply_underflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1e-30]) * Vector([1e-30])
++        assert str(error.value) == 'value out of range: underflow'
++
++    def test_multiply_underflow_before_overflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1e-30, 1e20]) * Vector([1e-30, 1e20])
++        assert str(error.value) == 'value out of range: underflow'
++
++    def test_multiply_subnormal(self) -> None:
++        assert (Vector([1e-20]) * Vector([1e-20])).to_list() == [9.99994610111476e-41]
++
++    def test_multiply_zero(self) -> None:
++        assert (Vector([0, -0.0]) * Vector([1e-30, 5])).to_text() == '[0.0,-0.0]'
++
++    def test_multiply_scalar(self) -> None:
++        with pytest.raises(TypeError):
++            Vector([1]) * 2  # type: ignore
++        with pytest.raises(TypeError):
++            2 * Vector([1])  # type: ignore
++
++    def test_concat(self) -> None:
++        a = Vector([1, 2])
++        b = Vector([3])
++        assert a.concat(b) == Vector([1, 2, 3])
++        assert a.to_list() == [1, 2]
++
++    def test_concat_max_dimensions(self) -> None:
++        assert Vector([1.0] * 8000).concat(Vector([1.0] * 8000)).dimensions() == 16000
++        with pytest.raises(ValueError) as error:
++            Vector([1.0] * 8000).concat(Vector([1.0] * 8001))
++        assert str(error.value) == 'vector cannot have more than 16000 dimensions'
++
++    def test_l2_normalize(self) -> None:
++        assert Vector([3, 4]).l2_normalize() == Vector([0.6, 0.8])
++        assert Vector([1, 1]).l2_normalize().to_list() == [0.7071067690849304, 0.7071067690849304]
++
++    def test_l2_normalize_large(self) -> None:
++        assert Vector([3e38, 3e38]).l2_normalize().to_list() == [0.7071067690849304, 0.7071067690849304]
++
++    def test_l2_normalize_zero(self) -> None:
++        assert Vector([0, 0, 0]).l2_normalize() == Vector([0, 0, 0])
++
++    def test_binary_quantize(self) -> None:
++        assert Vector([1, -2, 0]).binary_quantize() == Bit('100')
++        assert Vector([-0.0, 1e-45]).binary_quantize() == Bit('01')
++
++    def test_subvector(self) -> None:
++        vec = Vector([1, 2, 3, 4, 5])
++        assert vec.subvector(2, 3) == Vector([2, 3, 4])
++        assert vec.subvector(4, 10) == Vector([4, 5])
++        assert vec.subvector(0, 2) == Vector([1])
++        assert vec.subvector(1, 2147483647) == vec
++
++    @pytest.mark.parametrize('start,count', [(-5, 2), (6, 1), (1, 0), (1, -1), (2147483647, 1)])
++    def test_subvector_invalid(self, start: int, count: int) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1, 2, 3, 4, 5]).subvector(start, count)
++        assert str(error.value) == 'vector must have at least 1 dimension'
