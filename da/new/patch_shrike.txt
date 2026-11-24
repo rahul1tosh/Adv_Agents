@@ -1,74 +1,118 @@
 diff --git a/pgvector/_utils.py b/pgvector/_utils.py
-index 4cafc32..b95d39e 100644
+index 4cafc32..9ec53f9 100644
 --- a/pgvector/_utils.py
 +++ b/pgvector/_utils.py
-@@ -1,5 +1,7 @@
+@@ -1,4 +1,9 @@
++from decimal import Decimal
++from fractions import Fraction
 +import math
-+import struct
++import operator
  import sys
--from typing import TYPE_CHECKING, TypeAlias
-+from typing import TYPE_CHECKING, Callable, TypeAlias
++from collections.abc import Sequence
+ from typing import TYPE_CHECKING, TypeAlias
  
  if TYPE_CHECKING:
-     import numpy as np
-@@ -21,3 +23,55 @@ def is_sparse_array(value: object, /) -> bool:
+@@ -21,3 +26,98 @@ def is_sparse_array(value: object, /) -> bool:
      if (sparse := sys.modules.get('scipy.sparse')):
          return isinstance(value, (sparse.sparray, sparse.spmatrix))
      return False
 +
 +
-+def _format_shortest(v: float, max_digits: int, round_trip: Callable[[float], float], /) -> str:
-+    if v == 0:
-+        return '-0' if math.copysign(1.0, v) < 0 else '0'
++MAX_DIM = 16000
 +
-+    s = ''
-+    for p in range(1, max_digits + 1):
-+        s = '%.*e' % (p - 1, v)
++# smallest magnitude that rounds to infinity (round-to-nearest-even)
++_FLOAT32_MAX = 3.4028234663852886e38
++_FLOAT32_OVERFLOW = 2 ** 128 - 2 ** 103
++_FLOAT16_MAX = 65504.0
++_FLOAT16_OVERFLOW = 65520
++
++
++def _limits(name: str) -> tuple[int, float]:
++    if name == 'halfvec':
++        return _FLOAT16_OVERFLOW, _FLOAT16_MAX
++    return _FLOAT32_OVERFLOW, _FLOAT32_MAX
++
++
++def _is_numeric(value: object) -> bool:
++    if isinstance(value, (int, float)):
++        return True
++    cls = type(value)
++    return hasattr(cls, '__float__') or hasattr(cls, '__index__')
++
++
++def check_dimensions(dim: int, name: str, /) -> None:
++    if dim > MAX_DIM:
++        raise ValueError(f'{name} cannot have more than {MAX_DIM} dimensions')
++
++
++def check_floats(values: list[float], name: str, /) -> None:
++    overflow, _ = _limits(name)
++    for v in values:
++        if math.isnan(v):
++            raise ValueError(f'NaN not allowed in {name}')
++        if math.isinf(v):
++            raise ValueError(f'infinite value not allowed in {name}')
++        if abs(v) >= overflow:
++            raise ValueError('value out of range: overflow')
++
++
++def _to_float(value: object, name: str, overflow: int, max_value: float) -> float:
++    exact: float | int | Decimal | Fraction
++    if isinstance(value, float):
++        exact = float(value)
++    elif isinstance(value, int):
++        exact = int(value)
++    elif isinstance(value, Decimal):
++        if value.is_nan():
++            raise ValueError(f'NaN not allowed in {name}')
++        if value.is_infinite():
++            raise ValueError(f'infinite value not allowed in {name}')
++        exact = value
++    elif isinstance(value, Fraction):
++        exact = value
++    elif not hasattr(type(value), '__float__'):
++        exact = operator.index(value)  # type: ignore
++    else:
 +        try:
-+            if round_trip(float(s)) == v:
-+                break
++            exact = float(value)  # type: ignore
 +        except OverflowError:
-+            pass
++            raise ValueError('value out of range: overflow')
 +
-+    mantissa, exp_str = s.split('e')
-+    sign = ''
-+    if mantissa[0] == '-':
-+        sign = '-'
-+        mantissa = mantissa[1:]
-+    digits = mantissa.replace('.', '').rstrip('0') or '0'
-+    x = int(exp_str)
++    if isinstance(exact, float):
++        if math.isnan(exact):
++            raise ValueError(f'NaN not allowed in {name}')
++        if math.isinf(exact):
++            raise ValueError(f'infinite value not allowed in {name}')
 +
-+    if -4 <= x < 16:
-+        if x < 0:
-+            return f'{sign}0.{"0" * (-x - 1)}{digits}'
-+        if len(digits) <= x + 1:
-+            return f'{sign}{digits}{"0" * (x + 1 - len(digits))}'
-+        return f'{sign}{digits[:x + 1]}.{digits[x + 1:]}'
++    negative = exact < 0
++    if abs(exact) >= overflow:
++        raise ValueError('value out of range: overflow')
 +
-+    frac = f'.{digits[1:]}' if len(digits) > 1 else ''
-+    return f'{sign}{digits[0]}{frac}e{"-" if x < 0 else "+"}{abs(x):02d}'
++    try:
++        f = float(exact)
++    except OverflowError:
++        raise ValueError('value out of range: overflow')
 +
-+
-+_float32 = struct.Struct('f')
-+_float16 = struct.Struct('e')
++    # value rounds to a finite number, so clamp any double rounding
++    if abs(f) >= overflow:
++        f = -max_value if negative else max_value
++    return f
 +
 +
-+def _round_float32(v: float, /) -> float:
-+    return float(_float32.unpack(_float32.pack(v))[0])
++def to_floats(value: Sequence[object], name: str, /) -> list[float]:
++    for v in value:
++        if not _is_numeric(v):
++            raise ValueError('expected list[float]')
 +
++    check_dimensions(len(value), name)
 +
-+def _round_float16(v: float, /) -> float:
-+    return float(_float16.unpack(_float16.pack(v))[0])
-+
-+
-+def format_float32(v: float, /) -> str:
-+    return _format_shortest(v, 9, _round_float32)
-+
-+
-+def format_float16(v: float, /) -> str:
-+    return _format_shortest(v, 5, _round_float16)
++    overflow, max_value = _limits(name)
++    try:
++        return [_to_float(v, name, overflow, max_value) for v in value]
++    except TypeError:
++        raise ValueError('expected list[float]')
 diff --git a/pgvector/halfvec.py b/pgvector/halfvec.py
-index 2b3b325..0bf8927 100644
+index 2b3b325..95031fb 100644
 --- a/pgvector/halfvec.py
 +++ b/pgvector/halfvec.py
 @@ -3,7 +3,7 @@ from array import array
@@ -76,32 +120,63 @@ index 2b3b325..0bf8927 100644
  import sys
  from typing import TYPE_CHECKING
 -from ._utils import is_ndarray, ndarray
-+from ._utils import format_float16, is_ndarray, ndarray
++from ._utils import check_dimensions, check_floats, is_ndarray, ndarray, to_floats
  
  if TYPE_CHECKING:
      import numpy as np
-@@ -51,7 +51,7 @@ class HalfVector:
-         return np.frombuffer(self._value, dtype=np.float16)
+@@ -14,11 +14,8 @@ class HalfVector:
  
-     def to_text(self) -> str:
--        return f'[{",".join([str(v) for v in self.to_list()])}]'
-+        return f'[{",".join([format_float16(v) for v in self.to_list()])}]'
+     def __init__(self, value: list[float] | ndarray, /) -> None:
+         if isinstance(value, list):
+-            dim = len(value)
+-            try:
+-                self._value = array('H', struct.pack(f'{dim}e', *value))
+-            except struct.error:
+-                raise ValueError('expected list[float]')
++            floats = to_floats(value, 'halfvec')
++            self._value = array('H', struct.pack(f'{len(floats)}e', *floats))
+         elif is_ndarray(value):
+             import numpy as np
  
-     def to_binary(self) -> bytes:
-         if sys.byteorder == 'big':
-@@ -97,9 +97,8 @@ class HalfVector:
-         if value is None:
-             return value
+@@ -77,6 +74,8 @@ class HalfVector:
+         if unused != 0:
+             raise ValueError('expected unused to be 0')
  
--        # fewer allocations for lists
++        check_dimensions(dim, 'halfvec')
++
+         arr = array('H')
+         arr.frombytes(data)
+         if sys.byteorder != 'big':
+@@ -84,13 +83,17 @@ class HalfVector:
+ 
+         vec = cls.__new__(cls)
+         vec._value = arr
++        check_floats(vec.to_list(), 'halfvec')
+         return vec
+ 
+     @classmethod
+     def _from_text(cls, value: str, /) -> list[float]:
+         if len(value) == 2:
+             return []
+-        return [float(v) for v in value[1:-1].split(',')]
++        floats = [float(v) for v in value[1:-1].split(',')]
++        check_dimensions(len(floats), 'halfvec')
++        check_floats(floats, 'halfvec')
++        return floats
+ 
+     @classmethod
+     def _to_db(cls, value: list[float] | ndarray | HalfVector | None, /) -> str | None:
+@@ -99,7 +102,7 @@ class HalfVector:
+ 
+         # fewer allocations for lists
          if isinstance(value, list):
 -            return f'[{",".join([str(float(v)) for v in value])}]'  # type: ignore
-+            return cls([float(v) for v in value]).to_text()
++            return f'[{",".join([str(v) for v in to_floats(value, "halfvec")])}]'  # type: ignore
  
          if not isinstance(value, HalfVector):
              value = cls(value)
 diff --git a/pgvector/vector.py b/pgvector/vector.py
-index d86cba0..35f3093 100644
+index d86cba0..4a1c0ba 100644
 --- a/pgvector/vector.py
 +++ b/pgvector/vector.py
 @@ -3,7 +3,7 @@ from array import array
@@ -109,87 +184,180 @@ index d86cba0..35f3093 100644
  import sys
  from typing import TYPE_CHECKING
 -from ._utils import is_ndarray, ndarray
-+from ._utils import format_float32, is_ndarray, ndarray
++from ._utils import check_dimensions, check_floats, is_ndarray, ndarray, to_floats
  
  if TYPE_CHECKING:
      import numpy as np
-@@ -49,7 +49,7 @@ class Vector:
-         return np.frombuffer(self._value, dtype=np.float32)
+@@ -14,10 +14,7 @@ class Vector:
  
-     def to_text(self) -> str:
--        return f'[{",".join([str(v) for v in self._value])}]'
-+        return f'[{",".join([format_float32(v) for v in self._value])}]'
+     def __init__(self, value: list[float] | ndarray, /) -> None:
+         if isinstance(value, list):
+-            try:
+-                self._value = array('f', value)
+-            except TypeError:
+-                raise ValueError('expected list[float]')
++            self._value = array('f', to_floats(value, 'vector'))
+         elif is_ndarray(value):
+             import numpy as np
  
-     def to_binary(self) -> bytes:
-         if sys.byteorder == 'big':
-@@ -95,9 +95,8 @@ class Vector:
-         if value is None:
-             return value
+@@ -75,11 +72,15 @@ class Vector:
+         if unused != 0:
+             raise ValueError('expected unused to be 0')
  
--        # fewer allocations for lists
++        check_dimensions(dim, 'vector')
++
+         arr = array('f')
+         arr.frombytes(data)
+         if sys.byteorder != 'big':
+             arr.byteswap()
+ 
++        check_floats(arr.tolist(), 'vector')
++
+         vec = cls.__new__(cls)
+         vec._value = arr
+         return vec
+@@ -88,7 +89,10 @@ class Vector:
+     def _from_text(cls, value: str, /) -> list[float]:
+         if len(value) == 2:
+             return []
+-        return [float(v) for v in value[1:-1].split(',')]
++        floats = [float(v) for v in value[1:-1].split(',')]
++        check_dimensions(len(floats), 'vector')
++        check_floats(floats, 'vector')
++        return floats
+ 
+     @classmethod
+     def _to_db(cls, value: list[float] | ndarray | Vector | None, /) -> str | None:
+@@ -97,7 +101,7 @@ class Vector:
+ 
+         # fewer allocations for lists
          if isinstance(value, list):
 -            return f'[{",".join([str(float(v)) for v in value])}]'  # type: ignore
-+            return cls([float(v) for v in value]).to_text()
++            return f'[{",".join([str(v) for v in to_floats(value, "vector")])}]'  # type: ignore
  
          if not isinstance(value, Vector):
              value = cls(value)
 diff --git a/tests/test_half_vector.py b/tests/test_half_vector.py
-index a907c94..6b519de 100644
+index a907c94..db5ea52 100644
 --- a/tests/test_half_vector.py
 +++ b/tests/test_half_vector.py
-@@ -86,7 +86,15 @@ class TestHalfVector:
-         assert arr.dtype == np.float16
- 
-     def test_to_text(self) -> None:
--        assert HalfVector([1.5, 2, 3]).to_text() == '[1.5,2.0,3.0]'
-+        assert HalfVector([1.5, 2, 3]).to_text() == '[1.5,2,3]'
+@@ -136,3 +136,57 @@ class TestHalfVector:
+     def test_from_binary_non_zero_unused(self) -> None:
+         with pytest.raises(ValueError, match='expected unused to be 0'):
+             HalfVector.from_binary(struct.pack('>hh', 0, 1))
 +
-+    def test_to_text_shortest(self) -> None:
-+        assert HalfVector([0.1, 1 / 3, 2049]).to_text() == '[0.1,0.3333,2048]'
-+        assert HalfVector([-0.0, 0.0]).to_text() == '[-0,0]'
-+        assert HalfVector([65504, 6e-08]).to_text() == '[65500,6e-08]'
++    def test_init_list_nan(self) -> None:
++        with pytest.raises(ValueError, match='^NaN not allowed in halfvec$'):
++            HalfVector([1, float('nan')])
 +
-+    def test_to_db(self) -> None:
-+        assert HalfVector._to_db([0.1, 2]) == '[0.1,2]'
- 
-     def test_to_binary(self) -> None:
-         assert HalfVector([1.5, 2, 3]).to_binary() == struct.pack('>hh3e', 3, 0, 1.5, 2, 3)
-diff --git a/tests/test_sqlalchemy.py b/tests/test_sqlalchemy.py
-index dc58aeb..7f1d2da 100644
---- a/tests/test_sqlalchemy.py
-+++ b/tests/test_sqlalchemy.py
-@@ -516,7 +516,7 @@ class TestSqlalchemy:
- 
-     def test_literal_binds(self, engine: Engine) -> None:
-         sql = select(Item).order_by(Item.embedding.l2_distance([1, 2, 3])).compile(engine, compile_kwargs={'literal_binds': True})
--        assert "embedding <-> '[1.0,2.0,3.0]'" in str(sql)
-+        assert "embedding <-> '[1,2,3]'" in str(sql)
- 
-     def test_insert(self, engine: Engine) -> None:
-         with Session(engine) as session:
++    def test_init_list_infinite(self) -> None:
++        for v in [float('inf'), float('-inf')]:
++            with pytest.raises(ValueError, match='^infinite value not allowed in halfvec$'):
++                HalfVector([1, v])
++
++    def test_init_list_overflow(self) -> None:
++        for v in [65520, -65520]:
++            with pytest.raises(ValueError, match='^value out of range: overflow$'):
++                HalfVector([v])
++
++    def test_init_list_max(self) -> None:
++        HalfVector([65519, -65519, 1e-300])
++
++    def test_init_list_first_error(self) -> None:
++        with pytest.raises(ValueError, match='^infinite value not allowed in halfvec$'):
++            HalfVector([float('inf'), float('nan')])
++        with pytest.raises(ValueError, match='^expected list\\[float\\]$'):
++            HalfVector([float('nan'), 'a'])  # type: ignore
++
++    def test_init_list_dimensions(self) -> None:
++        assert HalfVector([1.0] * 16000).dimensions() == 16000
++        with pytest.raises(ValueError, match='^halfvec cannot have more than 16000 dimensions$'):
++            HalfVector([float('nan')] * 16001)
++
++    def test_to_db_invalid(self) -> None:
++        with pytest.raises(ValueError, match='^NaN not allowed in halfvec$'):
++            HalfVector._to_db([float('nan')])
++        with pytest.raises(ValueError, match='^value out of range: overflow$'):
++            HalfVector._to_db([65520])
++        assert HalfVector._to_db([1, 2, 3]) == '[1.0,2.0,3.0]'
++
++    def test_from_text_invalid(self) -> None:
++        with pytest.raises(ValueError, match='could not convert string to float'):
++            HalfVector.from_text('[nan,a]')
++        with pytest.raises(ValueError, match='^NaN not allowed in halfvec$'):
++            HalfVector.from_text('[1,NaN]')
++        with pytest.raises(ValueError, match='^infinite value not allowed in halfvec$'):
++            HalfVector._from_db('[1,-Infinity]')
++        with pytest.raises(ValueError, match='^value out of range: overflow$'):
++            HalfVector._from_db('[65520]')
++        assert HalfVector._from_db('[1.00000001]') == [1.00000001]
++
++    def test_from_binary_invalid(self) -> None:
++        with pytest.raises(ValueError, match='^NaN not allowed in halfvec$'):
++            HalfVector.from_binary(struct.pack('>hhe', 1, 0, float('nan')))
++        with pytest.raises(ValueError, match='^infinite value not allowed in halfvec$'):
++            HalfVector.from_binary(struct.pack('>hhe', 1, 0, float('inf')))
++        with pytest.raises(ValueError, match='^halfvec cannot have more than 16000 dimensions$'):
++            HalfVector.from_binary(struct.pack('>hh', 16001, 0) + bytes(2 * 16001))
 diff --git a/tests/test_vector.py b/tests/test_vector.py
-index 13a9cc7..45e9ddd 100644
+index 13a9cc7..6f618be 100644
 --- a/tests/test_vector.py
 +++ b/tests/test_vector.py
-@@ -86,7 +86,20 @@ class TestVector:
-         assert arr.dtype == np.float32
- 
-     def test_to_text(self) -> None:
--        assert Vector([1.5, 2, 3]).to_text() == '[1.5,2.0,3.0]'
-+        assert Vector([1.5, 2, 3]).to_text() == '[1.5,2,3]'
+@@ -136,3 +136,57 @@ class TestVector:
+     def test_from_binary_non_zero_unused(self) -> None:
+         with pytest.raises(ValueError, match='expected unused to be 0'):
+             Vector.from_binary(struct.pack('>hh', 0, 1))
 +
-+    def test_to_text_shortest(self) -> None:
-+        assert Vector([0.1, 1.5, 2]).to_text() == '[0.1,1.5,2]'
-+        assert Vector([-0.0, 0.0]).to_text() == '[-0,0]'
-+        assert Vector([100, 16777217]).to_text() == '[100,16777216]'
-+        assert Vector([1 / 3, 123456789]).to_text() == '[0.33333334,123456790]'
-+        assert Vector([0.0001, 1e-5, -2.5e-7]).to_text() == '[0.0001,1e-05,-2.5e-07]'
-+        assert Vector([3e38, 1e16]).to_text() == '[3e+38,1e+16]'
-+        assert Vector([]).to_text() == '[]'
++    def test_init_list_nan(self) -> None:
++        with pytest.raises(ValueError, match='^NaN not allowed in vector$'):
++            Vector([1, float('nan')])
 +
-+    def test_to_db(self) -> None:
-+        assert Vector._to_db([0.1, 2]) == '[0.1,2]'
-+        assert Vector._to_db([0.1, 2]) == Vector([0.1, 2]).to_text()
- 
-     def test_to_binary(self) -> None:
-         assert Vector([1.5, 2, 3]).to_binary() == struct.pack('>hh3f', 3, 0, 1.5, 2, 3)
++    def test_init_list_infinite(self) -> None:
++        for v in [float('inf'), float('-inf')]:
++            with pytest.raises(ValueError, match='^infinite value not allowed in vector$'):
++                Vector([1, v])
++
++    def test_init_list_overflow(self) -> None:
++        for v in [3.5e38, -3.5e38]:
++            with pytest.raises(ValueError, match='^value out of range: overflow$'):
++                Vector([v])
++
++    def test_init_list_max(self) -> None:
++        Vector([3.4028235e38, -3.4028235e38, 1e-300])
++
++    def test_init_list_first_error(self) -> None:
++        with pytest.raises(ValueError, match='^infinite value not allowed in vector$'):
++            Vector([float('inf'), float('nan')])
++        with pytest.raises(ValueError, match='^expected list\\[float\\]$'):
++            Vector([float('nan'), 'a'])  # type: ignore
++
++    def test_init_list_dimensions(self) -> None:
++        assert Vector([1.0] * 16000).dimensions() == 16000
++        with pytest.raises(ValueError, match='^vector cannot have more than 16000 dimensions$'):
++            Vector([float('nan')] * 16001)
++
++    def test_to_db_invalid(self) -> None:
++        with pytest.raises(ValueError, match='^NaN not allowed in vector$'):
++            Vector._to_db([float('nan')])
++        with pytest.raises(ValueError, match='^value out of range: overflow$'):
++            Vector._to_db([3.5e38])
++        assert Vector._to_db([1, 2, 3]) == '[1.0,2.0,3.0]'
++
++    def test_from_text_invalid(self) -> None:
++        with pytest.raises(ValueError, match='could not convert string to float'):
++            Vector.from_text('[nan,a]')
++        with pytest.raises(ValueError, match='^NaN not allowed in vector$'):
++            Vector.from_text('[1,NaN]')
++        with pytest.raises(ValueError, match='^infinite value not allowed in vector$'):
++            Vector._from_db('[1,-Infinity]')
++        with pytest.raises(ValueError, match='^value out of range: overflow$'):
++            Vector._from_db('[3.5e38]')
++        assert Vector._from_db('[1.00000001]') == [1.00000001]
++
++    def test_from_binary_invalid(self) -> None:
++        with pytest.raises(ValueError, match='^NaN not allowed in vector$'):
++            Vector.from_binary(struct.pack('>hhf', 1, 0, float('nan')))
++        with pytest.raises(ValueError, match='^infinite value not allowed in vector$'):
++            Vector.from_binary(struct.pack('>hhf', 1, 0, float('inf')))
++        with pytest.raises(ValueError, match='^vector cannot have more than 16000 dimensions$'):
++            Vector.from_binary(struct.pack('>hh', 16001, 0) + bytes(4 * 16001))
