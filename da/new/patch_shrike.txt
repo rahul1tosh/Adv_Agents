@@ -1,274 +1,271 @@
 diff --git a/sqllineage/core/parser/__init__.py b/sqllineage/core/parser/__init__.py
-index 63f1dbf..84e46de 100644
+index 7e0ea30..d37d9ff 100644
 --- a/sqllineage/core/parser/__init__.py
 +++ b/sqllineage/core/parser/__init__.py
-@@ -3,21 +3,92 @@ from sqllineage.core.holders import SubQueryLineageHolder
- from sqllineage.core.models import Column, LateralView, Path, SubQuery, Table
- from sqllineage.exceptions import SQLLineageException
- 
-+# structure of a set operation: a leaf is the index of a query in the set operation,
-+# a node is a list of (whether combined with the previous ones by name, child), the first flag is unused
-+UnionTree = int | list[tuple[bool, "UnionTree"]]
-+
- 
- class SourceHandlerMixin:
-     tables: list[Path | SubQuery | Table]
+@@ -9,10 +9,63 @@ class SourceHandlerMixin:
      columns: list[Column]
-     # (column index, table index, whether the query after it is combined by name, like UNION ALL BY NAME)
-     union_barriers: list[tuple[int, int, bool]]
-+    union_tree: UnionTree | None = None
-+
-+    @staticmethod
-+    def _union_tree_by_name(tree: UnionTree) -> bool:
-+        if isinstance(tree, int):
-+            return False
-+        return any(
-+            (by_name and i > 0) or SourceHandlerMixin._union_tree_by_name(child)
-+            for i, (by_name, child) in enumerate(tree)
-+        )
-+
-+    @staticmethod
-+    def _union_tree_leaf_count(tree: UnionTree) -> int:
-+        if isinstance(tree, int):
-+            return 1
-+        return sum(
-+            SourceHandlerMixin._union_tree_leaf_count(child) for _, child in tree
-+        )
-+
-+    @staticmethod
-+    def _resolve_union_tree(
-+        tree: UnionTree, col_grps: list[list[Column]]
-+    ) -> tuple[list[Column], dict[int, list[int]]]:
-+        """
-+        returns the columns that define each result column of the set operation,
-+        and for each query, the position in the result of each of its columns
-+        """
-+        if isinstance(tree, int):
-+            cols = col_grps[tree]
-+            return list(cols), {tree: list(range(len(cols)))}
-+        result: list[Column] = []
-+        positions: dict[str, int] = {}
-+        slots: dict[int, list[int]] = {}
-+        for i, (by_name, child) in enumerate(tree):
-+            child_result, child_slots = SourceHandlerMixin._resolve_union_tree(
-+                child, col_grps
-+            )
-+            mapping = []
-+            for j, col in enumerate(child_result):
-+                if i > 0 and by_name:
-+                    pos = positions.get(col.raw_name)
-+                    if pos is None:
-+                        pos = len(result)
-+                        result.append(col)
-+                        positions[col.raw_name] = pos
-+                else:
-+                    pos = j
-+                    if pos >= len(result):
-+                        result.append(col)
-+                        positions.setdefault(col.raw_name, pos)
-+                mapping.append(pos)
-+            for grp_idx, grp_slots in child_slots.items():
-+                slots[grp_idx] = [mapping[p] for p in grp_slots]
-+        return result, slots
+     union_barriers: list[tuple[int, int]]
  
++    def _column_groups(self) -> list[list[Column]]:
++        groups = []
++        prev_col_barrier = 0
++        for col_barrier, _ in self.union_barriers:
++            groups.append(self.columns[prev_col_barrier:col_barrier])
++            prev_col_barrier = col_barrier
++        return groups
++
++    def _resolve_by_name_slots(
++        self, by_name_groups: set[int]
++    ) -> tuple[list[list[int]], list[Column]]:
++        """
++        For set operations combining queries by column name (UNION [ALL] BY NAME, UNION ALL CORRESPONDING),
++        compute the result column slot for each column in each query group, and the first column of each slot.
++        Groups not in by_name_groups are combined by position.
++        """
++        slots: list[list[int]] = []
++        slot_columns: list[Column] = []
++        slot_names: list[str] = []
++        for i, col_grp in enumerate(self._column_groups()):
++            grp_slots = []
++            for idx, col in enumerate(col_grp):
++                if i == 0 or i in by_name_groups:
++                    if col.raw_name in slot_names:
++                        slot = slot_names.index(col.raw_name)
++                    else:
++                        slot = len(slot_names)
++                        slot_names.append(col.raw_name)
++                        slot_columns.append(col)
++                else:
++                    slot = idx
++                grp_slots.append(slot)
++            slots.append(grp_slots)
++        return slots, slot_columns
++
      def end_of_query_cleanup(self, holder: SubQueryLineageHolder) -> None:
          for i, tbl in enumerate(self.tables):
              holder.add_read(tbl)
-         self.union_barriers.append((len(self.columns), len(self.tables), False))
--        # result column of each column name, for queries combined by name
--        union_columns: dict[str, Column] = {}
-+        col_grps = []
-+        for i, (col_barrier, _, _) in enumerate(self.union_barriers):
-+            prev_col_barrier = 0 if i == 0 else self.union_barriers[i - 1][0]
-+            col_grps.append(self.columns[prev_col_barrier:col_barrier])
-+        # for set operations combining queries by name, the result column of each column in each query
-+        result_columns: list[Column] = []
-+        result_slots: dict[int, list[int]] | None = None
-+        if (
-+            (tree := self.union_tree) is not None
-+            and self._union_tree_by_name(tree)
-+            and self._union_tree_leaf_count(tree) == len(col_grps)
-+        ):
-+            result_columns, result_slots = self._resolve_union_tree(tree, col_grps)
-+            if holder.write and len(holder.write_columns) == len(result_columns):
-+                result_columns = holder.write_columns
-         for i, (col_barrier, tbl_barrier, _) in enumerate(self.union_barriers):
--            prev_col_barrier, prev_tbl_barrier, by_name = (
-+            prev_col_barrier, prev_tbl_barrier, _ = (
-                 (0, 0, False) if i == 0 else self.union_barriers[i - 1]
-             )
-             col_grp = self.columns[prev_col_barrier:col_barrier]
-@@ -28,15 +99,12 @@ class SourceHandlerMixin:
-                 tgt_tbl = next(iter(holder.write))
-                 lateral_column_aliases: dict[str, list[Column]] = {}
-                 alias_mapping = holder.get_alias_mapping_from_table_group(tbl_grp)
-+                for col in self.columns:
-+                    col.parent = tgt_tbl
-                 for idx, tgt_col_from_query in enumerate(col_grp):
--                    tgt_col_from_query.parent = tgt_tbl
+         self.union_barriers.append((len(self.columns), len(self.tables)))
++        by_name_groups = {
++            i + 1
++            for i, by_name in enumerate(getattr(self, "union_by_name", []))
++            if by_name
++        }
++        by_name_slots: list[list[int]] = []
++        slot_targets: list[Column] = []
++        if by_name_groups:
++            by_name_slots, slot_targets = self._resolve_by_name_slots(by_name_groups)
++            if holder.write:
++                if len(holder.write) > 1:
++                    raise SQLLineageException
++                tgt_tbl = next(iter(holder.write))
++                if len(write_columns := holder.write_columns) == len(slot_targets):
++                    slot_targets = write_columns
++                else:
++                    for col in slot_targets:
++                        col.parent = tgt_tbl
+         for i, (col_barrier, tbl_barrier) in enumerate(self.union_barriers):
+             prev_col_barrier, prev_tbl_barrier = (
+                 (0, 0) if i == 0 else self.union_barriers[i - 1]
+@@ -30,7 +83,11 @@ class SourceHandlerMixin:
                      tgt_col_resolved = tgt_col_from_query
--                    if by_name:
--                        # UNION ALL BY NAME: a column goes to the result column of the same name
--                        # and a column not seen in previous queries is added to the end
--                        tgt_col_resolved = union_columns.setdefault(
--                            tgt_col_from_query.raw_name, tgt_col_from_query
--                        )
-+                    if result_slots is not None:
-+                        tgt_col_resolved = result_columns[result_slots[i][idx]]
-                     elif len(write_columns := holder.write_columns) == len(col_grp):
-                         # example query: create view test (col3) select col1 as col2 from tab
-                         # without write_columns = [col3] information, by default src_col = col1 and tgt_col = col2
-@@ -44,8 +112,6 @@ class SourceHandlerMixin:
-                         # for invalid query: create view test (col3, col4) select col1 as col2 from tab,
-                         # when the length doesn't match, we fall back to default behavior
-                         tgt_col_resolved = write_columns[idx]
--                    if i == 0:
--                        union_columns[tgt_col_from_query.raw_name] = tgt_col_resolved
                      src_cols_resolved = []
                      for src_col in tgt_col_from_query.to_source_columns(alias_mapping):
-                         # lateral column alias handling
+-                        if len(write_columns := holder.write_columns) == len(col_grp):
++                        if by_name_groups:
++                            slot = by_name_slots[i][idx]
++                            if slot < len(slot_targets):
++                                tgt_col_resolved = slot_targets[slot]
++                        elif len(write_columns := holder.write_columns) == len(col_grp):
+                             # example query: create view test (col3) select col1 as col2 from tab
+                             # without write_columns = [col3] information, by default src_col = col1 and tgt_col = col2
+                             # when write_columns exist and length matches, we want tgt_col = col3 instead of col2
 diff --git a/sqllineage/core/parser/sqlfluff/extractors/select.py b/sqllineage/core/parser/sqlfluff/extractors/select.py
-index bc15c0b..a0eb616 100644
+index dcd5840..e1bad79 100644
 --- a/sqllineage/core/parser/sqlfluff/extractors/select.py
 +++ b/sqllineage/core/parser/sqlfluff/extractors/select.py
-@@ -2,7 +2,7 @@ from sqlfluff.core.parser import BaseSegment
+@@ -10,6 +10,7 @@ from sqllineage.core.parser.sqlfluff.models import (
+ )
+ from sqllineage.core.parser.sqlfluff.utils import (
+     find_table_identifier,
++    is_by_name_set_operator,
+     is_set_expression,
+     list_child_segments,
+ )
+@@ -29,6 +30,7 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+         self.columns = []
+         self.tables = []
+         self.union_barriers = []
++        self.union_by_name: list[bool] = []
  
- from sqllineage.core.holders import SubQueryLineageHolder
- from sqllineage.core.metadata_provider import MetaDataProvider
--from sqllineage.core.parser import SourceHandlerMixin
-+from sqllineage.core.parser import SourceHandlerMixin, UnionTree
- from sqllineage.core.parser.sqlfluff.extractors.base import BaseExtractor
- from sqllineage.core.parser.sqlfluff.models import (
-     SqlFluffColumn,
-@@ -59,7 +59,7 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
-             self._handle_select_statement_child_segments(segment, holder)
- 
-             if is_set_expression(segment):
--                self._handle_set_expression(segment, holder)
-+                self.union_tree = self._handle_set_expression(segment, holder)
- 
-         self.end_of_query_cleanup(holder)
- 
-@@ -133,12 +133,14 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
- 
-     def _handle_set_expression(
+     def extract(
+         self,
+@@ -119,11 +121,16 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
          self, segment: BaseSegment, holder: SubQueryLineageHolder
--    ) -> None:
-+    ) -> UnionTree:
+     ) -> None:
          # Recursively handle set_expression and nested bracketed set_expressions
-+        tree: list[tuple[bool, UnionTree]] = []
-         set_operators = segment.get_children("set_operator")
++        by_name = False
          for idx, child in enumerate(
-             segment.get_children("select_statement", "bracketed")
+-            segment.get_children("select_statement", "bracketed")
++            segment.get_children("select_statement", "bracketed", "set_operator")
          ):
-+            by_name = False
++            if child.type == "set_operator":
++                by_name = is_by_name_set_operator(child)
++                continue
              if idx != 0:
-                 # UNION [ALL] BY NAME (snowflake, duckdb, bigquery) and UNION ALL CORRESPONDING (bigquery)
-                 # combine the query that follows by column name instead of by position
-@@ -152,6 +154,7 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
-                 self.union_barriers.append(
-                     (len(self.columns), len(self.tables), by_name)
-                 )
-+            leaf: UnionTree = len(self.union_barriers)
+                 self.union_barriers.append((len(self.columns), len(self.tables)))
++                self.union_by_name.append(by_name)
              match child.type:
                  case "select_statement":
                      for seg in list_child_segments(child):
-@@ -162,10 +165,12 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
-                     if any(c.type == "set_expression" for c in inner_children):
-                         for c in inner_children:
-                             if c.type == "set_expression":
--                                self._handle_set_expression(c, holder)
-+                                leaf = self._handle_set_expression(c, holder)
-                     else:
-                         for seg in inner_children:
-                             self._handle_select_statement_child_segments(seg, holder)
-+            tree.append((by_name, leaf))
-+        return tree
- 
-     def _collect_subqueries_in_set_expression(self, segment: BaseSegment):
-         subqueries = []
-diff --git a/tests/sql/column/test_column_select_union_dialect_specific.py b/tests/sql/column/test_column_select_union_dialect_specific.py
-index 7237342..20fda46 100644
---- a/tests/sql/column/test_column_select_union_dialect_specific.py
-+++ b/tests/sql/column/test_column_select_union_dialect_specific.py
-@@ -214,3 +214,80 @@ FROM (SELECT col1, col2
-         dialect=dialect,
-         test_sqlparse=False,
+diff --git a/sqllineage/core/parser/sqlfluff/utils.py b/sqllineage/core/parser/sqlfluff/utils.py
+index a054923..f61d5d2 100644
+--- a/sqllineage/core/parser/sqlfluff/utils.py
++++ b/sqllineage/core/parser/sqlfluff/utils.py
+@@ -23,6 +23,15 @@ def is_negligible(segment: BaseSegment) -> bool:
      )
+ 
+ 
++def is_by_name_set_operator(segment: BaseSegment) -> bool:
++    """
++    Check if a set_operator combines queries by column name instead of by position, like:
++    UNION [ALL] BY NAME (Snowflake, DuckDB, BigQuery) or UNION ALL CORRESPONDING (BigQuery)
++    """
++    keywords = [kw.raw_upper for kw in segment.get_children("keyword")]
++    return "CORRESPONDING" in keywords or ("BY" in keywords and "NAME" in keywords)
 +
 +
-+@pytest.mark.parametrize("dialect", ["duckdb", "snowflake"])
-+def test_union_all_by_name_with_new_columns_and_column_specified_in_dml(dialect: str):
-+    sql = """INSERT INTO tab3 (col4, col5, col6)
-+SELECT col1, col2
-+FROM tab1
-+UNION ALL BY NAME
-+SELECT col3, col1
-+FROM tab2"""
+ def is_set_expression(segment: BaseSegment) -> bool:
+     return segment.type == "set_expression" or any(
+         seg.type == "set_expression" for seg in segment.segments
+diff --git a/tests/sql/column/test_column_select_union_by_name_dialect_specific.py b/tests/sql/column/test_column_select_union_by_name_dialect_specific.py
+new file mode 100644
+index 0000000..874bb76
+--- /dev/null
++++ b/tests/sql/column/test_column_select_union_by_name_dialect_specific.py
+@@ -0,0 +1,126 @@
++import pytest
++
++from sqllineage.utils.entities import ColumnQualifierTuple
++
++from ...helpers import assert_column_lineage_equal
++
++
++def _lineage(*pairs: tuple[str, str, str, str]):
++    return [
++        (ColumnQualifierTuple(src_col, src_tbl), ColumnQualifierTuple(tgt_col, tgt_tbl))
++        for src_col, src_tbl, tgt_col, tgt_tbl in pairs
++    ]
++
++
++@pytest.mark.parametrize(
++    "dialect,set_operator",
++    [
++        ("snowflake", "UNION ALL BY NAME"),
++        ("snowflake", "UNION BY NAME"),
++        ("duckdb", "UNION ALL BY NAME"),
++        ("duckdb", "UNION BY NAME"),
++        ("bigquery", "UNION ALL BY NAME"),
++        ("bigquery", "UNION ALL CORRESPONDING"),
++    ],
++)
++def test_union_by_name_matches_columns_by_name(dialect: str, set_operator: str):
++    sql = f"""INSERT INTO tgt
++SELECT a, b FROM t1
++{set_operator}
++SELECT b, a FROM t2"""
 +    assert_column_lineage_equal(
 +        sql,
-+        [
-+            (
-+                ColumnQualifierTuple("col1", "tab1"),
-+                ColumnQualifierTuple("col4", "tab3"),
-+            ),
-+            (
-+                ColumnQualifierTuple("col2", "tab1"),
-+                ColumnQualifierTuple("col5", "tab3"),
-+            ),
-+            (
-+                ColumnQualifierTuple("col1", "tab2"),
-+                ColumnQualifierTuple("col4", "tab3"),
-+            ),
-+            (
-+                ColumnQualifierTuple("col3", "tab2"),
-+                ColumnQualifierTuple("col6", "tab3"),
-+            ),
-+        ],
++        _lineage(
++            ("a", "t1", "a", "tgt"),
++            ("a", "t2", "a", "tgt"),
++            ("b", "t1", "b", "tgt"),
++            ("b", "t2", "b", "tgt"),
++        ),
 +        dialect=dialect,
 +        test_sqlparse=False,
 +    )
 +
 +
-+@pytest.mark.parametrize("dialect", ["duckdb", "snowflake"])
-+def test_union_all_with_nested_union_all_by_name(dialect: str):
-+    sql = """INSERT INTO tab4
-+SELECT col1, col2
-+FROM tab1
-+UNION ALL
-+(SELECT col2, col1
-+ FROM tab2
-+ UNION ALL BY NAME
-+ SELECT col1, col2
-+ FROM tab3)"""
++@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
++def test_union_by_name_with_alias_and_new_columns(dialect: str):
++    sql = """INSERT INTO tgt
++SELECT a, col2 AS b FROM t1
++UNION ALL BY NAME
++SELECT c, b, a FROM t2
++UNION ALL BY NAME
++SELECT d, col2 AS c FROM t3"""
 +    assert_column_lineage_equal(
 +        sql,
-+        [
-+            (
-+                ColumnQualifierTuple("col1", "tab1"),
-+                ColumnQualifierTuple("col1", "tab4"),
-+            ),
-+            (
-+                ColumnQualifierTuple("col2", "tab1"),
-+                ColumnQualifierTuple("col2", "tab4"),
-+            ),
-+            (
-+                ColumnQualifierTuple("col2", "tab2"),
-+                ColumnQualifierTuple("col1", "tab4"),
-+            ),
-+            (
-+                ColumnQualifierTuple("col1", "tab2"),
-+                ColumnQualifierTuple("col2", "tab4"),
-+            ),
-+            (
-+                ColumnQualifierTuple("col2", "tab3"),
-+                ColumnQualifierTuple("col1", "tab4"),
-+            ),
-+            (
-+                ColumnQualifierTuple("col1", "tab3"),
-+                ColumnQualifierTuple("col2", "tab4"),
-+            ),
-+        ],
++        _lineage(
++            ("a", "t1", "a", "tgt"),
++            ("a", "t2", "a", "tgt"),
++            ("col2", "t1", "b", "tgt"),
++            ("b", "t2", "b", "tgt"),
++            ("c", "t2", "c", "tgt"),
++            ("col2", "t3", "c", "tgt"),
++            ("d", "t3", "d", "tgt"),
++        ),
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
++def test_union_by_name_with_target_columns(dialect: str):
++    sql = """INSERT INTO tgt (x, y, z)
++SELECT a, b FROM t1
++UNION ALL BY NAME
++SELECT c, b, a FROM t2"""
++    assert_column_lineage_equal(
++        sql,
++        _lineage(
++            ("a", "t1", "x", "tgt"),
++            ("a", "t2", "x", "tgt"),
++            ("b", "t1", "y", "tgt"),
++            ("b", "t2", "y", "tgt"),
++            ("c", "t2", "z", "tgt"),
++        ),
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
++def test_union_by_name_in_subquery(dialect: str):
++    sql = """INSERT INTO tgt
++SELECT a, b, c FROM (
++    SELECT a, b FROM t1
++    UNION ALL BY NAME
++    SELECT c, b, a FROM t2
++) sq"""
++    assert_column_lineage_equal(
++        sql,
++        _lineage(
++            ("a", "t1", "a", "tgt"),
++            ("a", "t2", "a", "tgt"),
++            ("b", "t1", "b", "tgt"),
++            ("b", "t2", "b", "tgt"),
++            ("c", "t2", "c", "tgt"),
++        ),
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize("dialect", ["snowflake", "duckdb", "bigquery"])
++def test_plain_union_all_still_matches_by_position(dialect: str):
++    sql = """INSERT INTO tgt
++SELECT a, b FROM t1
++UNION ALL
++SELECT b, a FROM t2"""
++    assert_column_lineage_equal(
++        sql,
++        _lineage(
++            ("a", "t1", "a", "tgt"),
++            ("b", "t2", "a", "tgt"),
++            ("b", "t1", "b", "tgt"),
++            ("a", "t2", "b", "tgt"),
++        ),
 +        dialect=dialect,
 +        test_sqlparse=False,
 +    )
