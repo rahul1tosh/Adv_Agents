@@ -1,248 +1,195 @@
-diff --git a/pgvector/vector.py b/pgvector/vector.py
-index d86cba0..b82ed35 100644
---- a/pgvector/vector.py
-+++ b/pgvector/vector.py
-@@ -1,13 +1,20 @@
- from __future__ import annotations
- from array import array
+diff --git a/pgvector/_utils.py b/pgvector/_utils.py
+index 4cafc32..b95d39e 100644
+--- a/pgvector/_utils.py
++++ b/pgvector/_utils.py
+@@ -1,5 +1,7 @@
 +import math
- import struct
++import struct
  import sys
--from typing import TYPE_CHECKING
-+from typing import TYPE_CHECKING, Callable
- from ._utils import is_ndarray, ndarray
-+from .bit import Bit
+-from typing import TYPE_CHECKING, TypeAlias
++from typing import TYPE_CHECKING, Callable, TypeAlias
  
  if TYPE_CHECKING:
      import numpy as np
+@@ -21,3 +23,55 @@ def is_sparse_array(value: object, /) -> bool:
+     if (sparse := sys.modules.get('scipy.sparse')):
+         return isinstance(value, (sparse.sparray, sparse.spmatrix))
+     return False
++
++
++def _format_shortest(v: float, max_digits: int, round_trip: Callable[[float], float], /) -> str:
++    if v == 0:
++        return '-0' if math.copysign(1.0, v) < 0 else '0'
++
++    s = ''
++    for p in range(1, max_digits + 1):
++        s = '%.*e' % (p - 1, v)
++        try:
++            if round_trip(float(s)) == v:
++                break
++        except OverflowError:
++            pass
++
++    mantissa, exp_str = s.split('e')
++    sign = ''
++    if mantissa[0] == '-':
++        sign = '-'
++        mantissa = mantissa[1:]
++    digits = mantissa.replace('.', '').rstrip('0') or '0'
++    x = int(exp_str)
++
++    if -4 <= x < 16:
++        if x < 0:
++            return f'{sign}0.{"0" * (-x - 1)}{digits}'
++        if len(digits) <= x + 1:
++            return f'{sign}{digits}{"0" * (x + 1 - len(digits))}'
++        return f'{sign}{digits[:x + 1]}.{digits[x + 1:]}'
++
++    frac = f'.{digits[1:]}' if len(digits) > 1 else ''
++    return f'{sign}{digits[0]}{frac}e{"-" if x < 0 else "+"}{abs(x):02d}'
++
++
++_float32 = struct.Struct('f')
++_float16 = struct.Struct('e')
++
++
++def _round_float32(v: float, /) -> float:
++    return float(_float32.unpack(_float32.pack(v))[0])
++
++
++def _round_float16(v: float, /) -> float:
++    return float(_float16.unpack(_float16.pack(v))[0])
++
++
++def format_float32(v: float, /) -> str:
++    return _format_shortest(v, 9, _round_float32)
++
++
++def format_float16(v: float, /) -> str:
++    return _format_shortest(v, 5, _round_float16)
+diff --git a/pgvector/halfvec.py b/pgvector/halfvec.py
+index 2b3b325..0bf8927 100644
+--- a/pgvector/halfvec.py
++++ b/pgvector/halfvec.py
+@@ -3,7 +3,7 @@ from array import array
+ import struct
+ import sys
+ from typing import TYPE_CHECKING
+-from ._utils import is_ndarray, ndarray
++from ._utils import format_float16, is_ndarray, ndarray
  
-+MAX_DIM = 16000
-+
-+# smallest magnitude that rounds to infinity as float32
-+_FLOAT32_OVERFLOW = 2.0 ** 128 - 2.0 ** 103
-+
+ if TYPE_CHECKING:
+     import numpy as np
+@@ -51,7 +51,7 @@ class HalfVector:
+         return np.frombuffer(self._value, dtype=np.float16)
  
- class Vector:
-     _value: array[float]
-@@ -38,6 +45,87 @@ class Vector:
-             return NotImplemented
-         return self._value == other._value
+     def to_text(self) -> str:
+-        return f'[{",".join([str(v) for v in self.to_list()])}]'
++        return f'[{",".join([format_float16(v) for v in self.to_list()])}]'
  
-+    def __add__(self, other: Vector, /) -> Vector:
-+        if not isinstance(other, Vector):
-+            return NotImplemented
-+        return self._elementwise(other, lambda x, y: x + y, False)
-+
-+    def __sub__(self, other: Vector, /) -> Vector:
-+        if not isinstance(other, Vector):
-+            return NotImplemented
-+        return self._elementwise(other, lambda x, y: x - y, False)
-+
-+    def __mul__(self, other: Vector, /) -> Vector:
-+        if not isinstance(other, Vector):
-+            return NotImplemented
-+        return self._elementwise(other, lambda x, y: x * y, True)
-+
-+    def concat(self, other: Vector, /) -> Vector:
-+        if not isinstance(other, Vector):
-+            raise TypeError('expected Vector')
-+        if len(self._value) + len(other._value) > MAX_DIM:
-+            raise ValueError(f'vector cannot have more than {MAX_DIM} dimensions')
-+        return self._from_array(self._value + other._value)
-+
-+    def l2_normalize(self) -> Vector:
-+        norm = 0.0
-+        for v in self._value:
-+            norm += v * v
-+        norm = math.sqrt(norm)
-+
-+        if norm == 0:
-+            return self._from_array(array('f', [0.0]) * len(self._value))
-+
-+        result = [v / norm for v in self._value]
-+        for r in result:
-+            if abs(r) >= _FLOAT32_OVERFLOW:
-+                raise ValueError('value out of range')
-+        return self._from_array(array('f', result))
-+
-+    def binary_quantize(self) -> Bit:
-+        return Bit([v > 0 for v in self._value])
-+
-+    def subvector(self, start: int, count: int, /) -> Vector:
-+        dim = len(self._value)
-+
-+        if count < 1:
-+            raise ValueError('vector must have at least 1 dimension')
-+
-+        end = min(start + count, dim + 1)
-+
-+        if start < 1:
-+            start = 1
-+        elif start > dim:
-+            raise ValueError('vector must have at least 1 dimension')
-+
-+        if end - start < 1:
-+            raise ValueError('vector must have at least 1 dimension')
-+
-+        return self._from_array(self._value[start - 1:end - 1])
-+
-+    def _elementwise(self, other: Vector, op: Callable[[float, float], float], check_underflow: bool) -> Vector:
-+        a = self._value
-+        b = other._value
-+        if len(a) != len(b):
-+            raise ValueError(f'different vector dimensions {len(a)} and {len(b)}')
-+
-+        arr = array('f')
-+        for x, y in zip(a, b):
-+            r = op(x, y)
-+            if abs(r) >= _FLOAT32_OVERFLOW:
-+                raise ValueError('value out of range')
-+            arr.append(r)
-+            if check_underflow and arr[-1] == 0 and x != 0 and y != 0:
-+                raise ValueError('value out of range: underflow')
-+
-+        return self._from_array(arr)
-+
-+    @classmethod
-+    def _from_array(cls, value: array[float], /) -> Vector:
-+        vec = cls.__new__(cls)
-+        vec._value = value
-+        return vec
-+
-     def dimensions(self) -> int:
-         return len(self._value)
+     def to_binary(self) -> bytes:
+         if sys.byteorder == 'big':
+@@ -97,9 +97,8 @@ class HalfVector:
+         if value is None:
+             return value
  
+-        # fewer allocations for lists
+         if isinstance(value, list):
+-            return f'[{",".join([str(float(v)) for v in value])}]'  # type: ignore
++            return cls([float(v) for v in value]).to_text()
+ 
+         if not isinstance(value, HalfVector):
+             value = cls(value)
+diff --git a/pgvector/vector.py b/pgvector/vector.py
+index d86cba0..35f3093 100644
+--- a/pgvector/vector.py
++++ b/pgvector/vector.py
+@@ -3,7 +3,7 @@ from array import array
+ import struct
+ import sys
+ from typing import TYPE_CHECKING
+-from ._utils import is_ndarray, ndarray
++from ._utils import format_float32, is_ndarray, ndarray
+ 
+ if TYPE_CHECKING:
+     import numpy as np
+@@ -49,7 +49,7 @@ class Vector:
+         return np.frombuffer(self._value, dtype=np.float32)
+ 
+     def to_text(self) -> str:
+-        return f'[{",".join([str(v) for v in self._value])}]'
++        return f'[{",".join([format_float32(v) for v in self._value])}]'
+ 
+     def to_binary(self) -> bytes:
+         if sys.byteorder == 'big':
+@@ -95,9 +95,8 @@ class Vector:
+         if value is None:
+             return value
+ 
+-        # fewer allocations for lists
+         if isinstance(value, list):
+-            return f'[{",".join([str(float(v)) for v in value])}]'  # type: ignore
++            return cls([float(v) for v in value]).to_text()
+ 
+         if not isinstance(value, Vector):
+             value = cls(value)
+diff --git a/tests/test_half_vector.py b/tests/test_half_vector.py
+index a907c94..6b519de 100644
+--- a/tests/test_half_vector.py
++++ b/tests/test_half_vector.py
+@@ -86,7 +86,15 @@ class TestHalfVector:
+         assert arr.dtype == np.float16
+ 
+     def test_to_text(self) -> None:
+-        assert HalfVector([1.5, 2, 3]).to_text() == '[1.5,2.0,3.0]'
++        assert HalfVector([1.5, 2, 3]).to_text() == '[1.5,2,3]'
++
++    def test_to_text_shortest(self) -> None:
++        assert HalfVector([0.1, 1 / 3, 2049]).to_text() == '[0.1,0.3333,2048]'
++        assert HalfVector([-0.0, 0.0]).to_text() == '[-0,0]'
++        assert HalfVector([65504, 6e-08]).to_text() == '[65500,6e-08]'
++
++    def test_to_db(self) -> None:
++        assert HalfVector._to_db([0.1, 2]) == '[0.1,2]'
+ 
+     def test_to_binary(self) -> None:
+         assert HalfVector([1.5, 2, 3]).to_binary() == struct.pack('>hh3e', 3, 0, 1.5, 2, 3)
+diff --git a/tests/test_sqlalchemy.py b/tests/test_sqlalchemy.py
+index dc58aeb..7f1d2da 100644
+--- a/tests/test_sqlalchemy.py
++++ b/tests/test_sqlalchemy.py
+@@ -516,7 +516,7 @@ class TestSqlalchemy:
+ 
+     def test_literal_binds(self, engine: Engine) -> None:
+         sql = select(Item).order_by(Item.embedding.l2_distance([1, 2, 3])).compile(engine, compile_kwargs={'literal_binds': True})
+-        assert "embedding <-> '[1.0,2.0,3.0]'" in str(sql)
++        assert "embedding <-> '[1,2,3]'" in str(sql)
+ 
+     def test_insert(self, engine: Engine) -> None:
+         with Session(engine) as session:
 diff --git a/tests/test_vector.py b/tests/test_vector.py
-index 13a9cc7..ea1a7f6 100644
+index 13a9cc7..45e9ddd 100644
 --- a/tests/test_vector.py
 +++ b/tests/test_vector.py
-@@ -1,4 +1,4 @@
--from pgvector import Vector
-+from pgvector import Bit, Vector
- import pytest
- import struct
- from .conftest import numpy as np
-@@ -136,3 +136,123 @@ class TestVector:
-     def test_from_binary_non_zero_unused(self) -> None:
-         with pytest.raises(ValueError, match='expected unused to be 0'):
-             Vector.from_binary(struct.pack('>hh', 0, 1))
+@@ -86,7 +86,20 @@ class TestVector:
+         assert arr.dtype == np.float32
+ 
+     def test_to_text(self) -> None:
+-        assert Vector([1.5, 2, 3]).to_text() == '[1.5,2.0,3.0]'
++        assert Vector([1.5, 2, 3]).to_text() == '[1.5,2,3]'
 +
-+    def test_add(self) -> None:
-+        a = Vector([1, 2, 3])
-+        b = Vector([4, 5, 6])
-+        assert a + b == Vector([5, 7, 9])
-+        assert a.to_list() == [1, 2, 3]
-+        assert b.to_list() == [4, 5, 6]
++    def test_to_text_shortest(self) -> None:
++        assert Vector([0.1, 1.5, 2]).to_text() == '[0.1,1.5,2]'
++        assert Vector([-0.0, 0.0]).to_text() == '[-0,0]'
++        assert Vector([100, 16777217]).to_text() == '[100,16777216]'
++        assert Vector([1 / 3, 123456789]).to_text() == '[0.33333334,123456790]'
++        assert Vector([0.0001, 1e-5, -2.5e-7]).to_text() == '[0.0001,1e-05,-2.5e-07]'
++        assert Vector([3e38, 1e16]).to_text() == '[3e+38,1e+16]'
++        assert Vector([]).to_text() == '[]'
 +
-+    def test_add_float32(self) -> None:
-+        assert (Vector([1]) + Vector([1e-8])).to_list() == [1]
-+
-+    def test_add_different_dimensions(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([1, 2, 3]) + Vector([1, 2])
-+        assert str(error.value) == 'different vector dimensions 3 and 2'
-+
-+    def test_add_overflow(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([3e38]) + Vector([3e38])
-+        assert str(error.value) == 'value out of range'
-+
-+    def test_add_max(self) -> None:
-+        assert (Vector([3.4028234663852886e38]) + Vector([2.0 ** 102])).to_list() == [3.4028234663852886e38]
-+        with pytest.raises(ValueError, match='value out of range'):
-+            Vector([3.4028234663852886e38]) + Vector([2.0 ** 103])
-+
-+    def test_add_non_vector(self) -> None:
-+        with pytest.raises(TypeError):
-+            Vector([1]) + [1]  # type: ignore
-+
-+    def test_subtract(self) -> None:
-+        assert Vector([1, 2, 3]) - Vector([4, 5, 6]) == Vector([-3, -3, -3])
-+
-+    def test_subtract_different_dimensions(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([1, 2]) - Vector([1, 2, 3])
-+        assert str(error.value) == 'different vector dimensions 2 and 3'
-+
-+    def test_subtract_overflow(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([-3e38]) - Vector([3e38])
-+        assert str(error.value) == 'value out of range'
-+
-+    def test_subtract_non_vector(self) -> None:
-+        with pytest.raises(TypeError):
-+            Vector([1]) - 1  # type: ignore
-+
-+    def test_multiply(self) -> None:
-+        assert Vector([1, 2, 3]) * Vector([4, 5, 6]) == Vector([4, 10, 18])
-+
-+    def test_multiply_different_dimensions(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([1, 2, 3]) * Vector([1, 2])
-+        assert str(error.value) == 'different vector dimensions 3 and 2'
-+
-+    def test_multiply_overflow(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([1e20]) * Vector([1e20])
-+        assert str(error.value) == 'value out of range'
-+
-+    def test_multiply_underflow(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([1e-30]) * Vector([1e-30])
-+        assert str(error.value) == 'value out of range: underflow'
-+
-+    def test_multiply_underflow_before_overflow(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([1e-30, 1e20]) * Vector([1e-30, 1e20])
-+        assert str(error.value) == 'value out of range: underflow'
-+
-+    def test_multiply_subnormal(self) -> None:
-+        assert (Vector([1e-20]) * Vector([1e-20])).to_list() == [9.99994610111476e-41]
-+
-+    def test_multiply_zero(self) -> None:
-+        assert (Vector([0, -0.0]) * Vector([1e-30, 5])).to_text() == '[0.0,-0.0]'
-+
-+    def test_multiply_scalar(self) -> None:
-+        with pytest.raises(TypeError):
-+            Vector([1]) * 2  # type: ignore
-+        with pytest.raises(TypeError):
-+            2 * Vector([1])  # type: ignore
-+
-+    def test_concat(self) -> None:
-+        a = Vector([1, 2])
-+        b = Vector([3])
-+        assert a.concat(b) == Vector([1, 2, 3])
-+        assert a.to_list() == [1, 2]
-+
-+    def test_concat_max_dimensions(self) -> None:
-+        assert Vector([1.0] * 8000).concat(Vector([1.0] * 8000)).dimensions() == 16000
-+        with pytest.raises(ValueError) as error:
-+            Vector([1.0] * 8000).concat(Vector([1.0] * 8001))
-+        assert str(error.value) == 'vector cannot have more than 16000 dimensions'
-+
-+    def test_l2_normalize(self) -> None:
-+        assert Vector([3, 4]).l2_normalize() == Vector([0.6, 0.8])
-+        assert Vector([1, 1]).l2_normalize().to_list() == [0.7071067690849304, 0.7071067690849304]
-+
-+    def test_l2_normalize_large(self) -> None:
-+        assert Vector([3e38, 3e38]).l2_normalize().to_list() == [0.7071067690849304, 0.7071067690849304]
-+
-+    def test_l2_normalize_zero(self) -> None:
-+        assert Vector([0, 0, 0]).l2_normalize() == Vector([0, 0, 0])
-+
-+    def test_binary_quantize(self) -> None:
-+        assert Vector([1, -2, 0]).binary_quantize() == Bit('100')
-+        assert Vector([-0.0, 1e-45]).binary_quantize() == Bit('01')
-+
-+    def test_subvector(self) -> None:
-+        vec = Vector([1, 2, 3, 4, 5])
-+        assert vec.subvector(2, 3) == Vector([2, 3, 4])
-+        assert vec.subvector(4, 10) == Vector([4, 5])
-+        assert vec.subvector(0, 2) == Vector([1])
-+        assert vec.subvector(1, 2147483647) == vec
-+
-+    @pytest.mark.parametrize('start,count', [(-5, 2), (6, 1), (1, 0), (1, -1), (2147483647, 1)])
-+    def test_subvector_invalid(self, start: int, count: int) -> None:
-+        with pytest.raises(ValueError) as error:
-+            Vector([1, 2, 3, 4, 5]).subvector(start, count)
-+        assert str(error.value) == 'vector must have at least 1 dimension'
++    def test_to_db(self) -> None:
++        assert Vector._to_db([0.1, 2]) == '[0.1,2]'
++        assert Vector._to_db([0.1, 2]) == Vector([0.1, 2]).to_text()
+ 
+     def test_to_binary(self) -> None:
+         assert Vector([1.5, 2, 3]).to_binary() == struct.pack('>hh3f', 3, 0, 1.5, 2, 3)
