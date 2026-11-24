@@ -1,780 +1,274 @@
-diff --git a/CHANGELOG.md b/CHANGELOG.md
-index f033cf1..b091d65 100644
---- a/CHANGELOG.md
-+++ b/CHANGELOG.md
-@@ -1,5 +1,6 @@
- ## 0.5.2 (unreleased)
+diff --git a/sqllineage/core/parser/__init__.py b/sqllineage/core/parser/__init__.py
+index 63f1dbf..84e46de 100644
+--- a/sqllineage/core/parser/__init__.py
++++ b/sqllineage/core/parser/__init__.py
+@@ -3,21 +3,92 @@ from sqllineage.core.holders import SubQueryLineageHolder
+ from sqllineage.core.models import Column, LateralView, Path, SubQuery, Table
+ from sqllineage.exceptions import SQLLineageException
  
-+- Added distance methods to `Vector` and `Bit`
- - Fixed memory leak with `register_vector` and `register_vector_async` for Psycopg 3
- - Fixed error with `Bit` constructor and empty strings
- - Fixed equality for `HalfVector` with signed zeros
-diff --git a/README.md b/README.md
-index 26dccfb..c3bdccd 100644
---- a/README.md
-+++ b/README.md
-@@ -732,6 +732,17 @@ Get a NumPy array
- arr = vec.to_numpy()
- ```
- 
-+Get the distance to another vector (matches the `<->`, `<#>`, `<=>`, and `<+>` operators in Postgres)
-+
-+```python
-+vec.l2_distance(other)
-+vec.max_inner_product(other)
-+vec.cosine_distance(other)
-+vec.l1_distance(other)
-+```
-+
-+Note: Distances are computed with `float32` arithmetic like pgvector, but results can differ slightly from servers that use SIMD or FMA instructions
-+
- ### Half Vectors
- 
- Create a half vector from a list
-@@ -823,6 +834,27 @@ Get a SciPy sparse array
- arr = vec.to_coo()
- ```
- 
-+### Bits
-+
-+Create a bit vector from a string
-+
-+```python
-+vec = Bit('101')
-+```
-+
-+Or a list, bytes, or NumPy array
-+
-+```python
-+vec = Bit([True, False, True])
-+```
-+
-+Get the distance to another bit vector (matches the `<~>` and `<%>` operators in Postgres)
-+
-+```python
-+vec.hamming_distance(other)
-+vec.jaccard_distance(other)
-+```
-+
- ## History
- 
- View the [changelog](https://github.com/pgvector/pgvector-python/blob/master/CHANGELOG.md)
-diff --git a/pgvector/_utils.py b/pgvector/_utils.py
-index 4cafc32..951cd69 100644
---- a/pgvector/_utils.py
-+++ b/pgvector/_utils.py
-@@ -1,3 +1,7 @@
-+from array import array
-+from collections.abc import Iterable
-+import math
-+from operator import mul
- import sys
- from typing import TYPE_CHECKING, TypeAlias
- 
-@@ -21,3 +25,23 @@ def is_sparse_array(value: object, /) -> bool:
-     if (sparse := sys.modules.get('scipy.sparse')):
-         return isinstance(value, (sparse.sparray, sparse.spmatrix))
-     return False
-+
-+
-+def float32_sum(values: Iterable[float], /) -> float:
-+    total = array('f', [0.0])
-+    for v in values:
-+        total[0] += v
-+    return total[0]
-+
-+
-+def float32_dot(a: Iterable[float], b: Iterable[float], /) -> float:
-+    return float32_sum(array('f', map(mul, a, b)))
-+
-+
-+def ieee_divide(x: float, y: float, /) -> float:
-+    try:
-+        return x / y
-+    except ZeroDivisionError:
-+        if x == 0 or math.isnan(x):
-+            return math.nan
-+        return math.copysign(math.inf, x) * math.copysign(1.0, y)
-diff --git a/pgvector/bit.py b/pgvector/bit.py
-index a9370e4..d12d906 100644
---- a/pgvector/bit.py
-+++ b/pgvector/bit.py
-@@ -1,21 +1,19 @@
- from __future__ import annotations
- from struct import pack, unpack_from
--from typing import TYPE_CHECKING
-+from typing import TYPE_CHECKING, TypeAlias
- from ._utils import is_ndarray
- 
- if TYPE_CHECKING:
-     import numpy as np
- 
-+    BitInput: TypeAlias = bytes | str | list[bool] | np.ndarray[tuple[int, ...], np.dtype[np.bool_ | np.uint8]]
++# structure of a set operation: a leaf is the index of a query in the set operation,
++# a node is a list of (whether combined with the previous ones by name, child), the first flag is unused
++UnionTree = int | list[tuple[bool, "UnionTree"]]
 +
  
- class Bit:
-     _length: int
-     _data: bytes
+ class SourceHandlerMixin:
+     tables: list[Path | SubQuery | Table]
+     columns: list[Column]
+     # (column index, table index, whether the query after it is combined by name, like UNION ALL BY NAME)
+     union_barriers: list[tuple[int, int, bool]]
++    union_tree: UnionTree | None = None
++
++    @staticmethod
++    def _union_tree_by_name(tree: UnionTree) -> bool:
++        if isinstance(tree, int):
++            return False
++        return any(
++            (by_name and i > 0) or SourceHandlerMixin._union_tree_by_name(child)
++            for i, (by_name, child) in enumerate(tree)
++        )
++
++    @staticmethod
++    def _union_tree_leaf_count(tree: UnionTree) -> int:
++        if isinstance(tree, int):
++            return 1
++        return sum(
++            SourceHandlerMixin._union_tree_leaf_count(child) for _, child in tree
++        )
++
++    @staticmethod
++    def _resolve_union_tree(
++        tree: UnionTree, col_grps: list[list[Column]]
++    ) -> tuple[list[Column], dict[int, list[int]]]:
++        """
++        returns the columns that define each result column of the set operation,
++        and for each query, the position in the result of each of its columns
++        """
++        if isinstance(tree, int):
++            cols = col_grps[tree]
++            return list(cols), {tree: list(range(len(cols)))}
++        result: list[Column] = []
++        positions: dict[str, int] = {}
++        slots: dict[int, list[int]] = {}
++        for i, (by_name, child) in enumerate(tree):
++            child_result, child_slots = SourceHandlerMixin._resolve_union_tree(
++                child, col_grps
++            )
++            mapping = []
++            for j, col in enumerate(child_result):
++                if i > 0 and by_name:
++                    pos = positions.get(col.raw_name)
++                    if pos is None:
++                        pos = len(result)
++                        result.append(col)
++                        positions[col.raw_name] = pos
++                else:
++                    pos = j
++                    if pos >= len(result):
++                        result.append(col)
++                        positions.setdefault(col.raw_name, pos)
++                mapping.append(pos)
++            for grp_idx, grp_slots in child_slots.items():
++                slots[grp_idx] = [mapping[p] for p in grp_slots]
++        return result, slots
  
--    def __init__(
--        self,
--        value: bytes | str | list[bool] | np.ndarray[tuple[int, ...], np.dtype[np.bool_ | np.uint8]],
--        /
+     def end_of_query_cleanup(self, holder: SubQueryLineageHolder) -> None:
+         for i, tbl in enumerate(self.tables):
+             holder.add_read(tbl)
+         self.union_barriers.append((len(self.columns), len(self.tables), False))
+-        # result column of each column name, for queries combined by name
+-        union_columns: dict[str, Column] = {}
++        col_grps = []
++        for i, (col_barrier, _, _) in enumerate(self.union_barriers):
++            prev_col_barrier = 0 if i == 0 else self.union_barriers[i - 1][0]
++            col_grps.append(self.columns[prev_col_barrier:col_barrier])
++        # for set operations combining queries by name, the result column of each column in each query
++        result_columns: list[Column] = []
++        result_slots: dict[int, list[int]] | None = None
++        if (
++            (tree := self.union_tree) is not None
++            and self._union_tree_by_name(tree)
++            and self._union_tree_leaf_count(tree) == len(col_grps)
++        ):
++            result_columns, result_slots = self._resolve_union_tree(tree, col_grps)
++            if holder.write and len(holder.write_columns) == len(result_columns):
++                result_columns = holder.write_columns
+         for i, (col_barrier, tbl_barrier, _) in enumerate(self.union_barriers):
+-            prev_col_barrier, prev_tbl_barrier, by_name = (
++            prev_col_barrier, prev_tbl_barrier, _ = (
+                 (0, 0, False) if i == 0 else self.union_barriers[i - 1]
+             )
+             col_grp = self.columns[prev_col_barrier:col_barrier]
+@@ -28,15 +99,12 @@ class SourceHandlerMixin:
+                 tgt_tbl = next(iter(holder.write))
+                 lateral_column_aliases: dict[str, list[Column]] = {}
+                 alias_mapping = holder.get_alias_mapping_from_table_group(tbl_grp)
++                for col in self.columns:
++                    col.parent = tgt_tbl
+                 for idx, tgt_col_from_query in enumerate(col_grp):
+-                    tgt_col_from_query.parent = tgt_tbl
+                     tgt_col_resolved = tgt_col_from_query
+-                    if by_name:
+-                        # UNION ALL BY NAME: a column goes to the result column of the same name
+-                        # and a column not seen in previous queries is added to the end
+-                        tgt_col_resolved = union_columns.setdefault(
+-                            tgt_col_from_query.raw_name, tgt_col_from_query
+-                        )
++                    if result_slots is not None:
++                        tgt_col_resolved = result_columns[result_slots[i][idx]]
+                     elif len(write_columns := holder.write_columns) == len(col_grp):
+                         # example query: create view test (col3) select col1 as col2 from tab
+                         # without write_columns = [col3] information, by default src_col = col1 and tgt_col = col2
+@@ -44,8 +112,6 @@ class SourceHandlerMixin:
+                         # for invalid query: create view test (col3, col4) select col1 as col2 from tab,
+                         # when the length doesn't match, we fall back to default behavior
+                         tgt_col_resolved = write_columns[idx]
+-                    if i == 0:
+-                        union_columns[tgt_col_from_query.raw_name] = tgt_col_resolved
+                     src_cols_resolved = []
+                     for src_col in tgt_col_from_query.to_source_columns(alias_mapping):
+                         # lateral column alias handling
+diff --git a/sqllineage/core/parser/sqlfluff/extractors/select.py b/sqllineage/core/parser/sqlfluff/extractors/select.py
+index bc15c0b..a0eb616 100644
+--- a/sqllineage/core/parser/sqlfluff/extractors/select.py
++++ b/sqllineage/core/parser/sqlfluff/extractors/select.py
+@@ -2,7 +2,7 @@ from sqlfluff.core.parser import BaseSegment
+ 
+ from sqllineage.core.holders import SubQueryLineageHolder
+ from sqllineage.core.metadata_provider import MetaDataProvider
+-from sqllineage.core.parser import SourceHandlerMixin
++from sqllineage.core.parser import SourceHandlerMixin, UnionTree
+ from sqllineage.core.parser.sqlfluff.extractors.base import BaseExtractor
+ from sqllineage.core.parser.sqlfluff.models import (
+     SqlFluffColumn,
+@@ -59,7 +59,7 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+             self._handle_select_statement_child_segments(segment, holder)
+ 
+             if is_set_expression(segment):
+-                self._handle_set_expression(segment, holder)
++                self.union_tree = self._handle_set_expression(segment, holder)
+ 
+         self.end_of_query_cleanup(holder)
+ 
+@@ -133,12 +133,14 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+ 
+     def _handle_set_expression(
+         self, segment: BaseSegment, holder: SubQueryLineageHolder
 -    ) -> None:
-+    def __init__(self, value: BitInput, /) -> None:
-         if isinstance(value, bytes):
-             self._length = 8 * len(value)
-             self._data = value
-@@ -63,6 +61,17 @@ class Bit:
-             return NotImplemented
-         return self._length == other._length and self._data == other._data
++    ) -> UnionTree:
+         # Recursively handle set_expression and nested bracketed set_expressions
++        tree: list[tuple[bool, UnionTree]] = []
+         set_operators = segment.get_children("set_operator")
+         for idx, child in enumerate(
+             segment.get_children("select_statement", "bracketed")
+         ):
++            by_name = False
+             if idx != 0:
+                 # UNION [ALL] BY NAME (snowflake, duckdb, bigquery) and UNION ALL CORRESPONDING (bigquery)
+                 # combine the query that follows by column name instead of by position
+@@ -152,6 +154,7 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+                 self.union_barriers.append(
+                     (len(self.columns), len(self.tables), by_name)
+                 )
++            leaf: UnionTree = len(self.union_barriers)
+             match child.type:
+                 case "select_statement":
+                     for seg in list_child_segments(child):
+@@ -162,10 +165,12 @@ class SelectExtractor(BaseExtractor, SourceHandlerMixin):
+                     if any(c.type == "set_expression" for c in inner_children):
+                         for c in inner_children:
+                             if c.type == "set_expression":
+-                                self._handle_set_expression(c, holder)
++                                leaf = self._handle_set_expression(c, holder)
+                     else:
+                         for seg in inner_children:
+                             self._handle_select_statement_child_segments(seg, holder)
++            tree.append((by_name, leaf))
++        return tree
  
-+    def hamming_distance(self, other: Bit | BitInput, /) -> float:
-+        a, b = self._distance_operands(other)
-+        return float((a ^ b).bit_count())
-+
-+    def jaccard_distance(self, other: Bit | BitInput, /) -> float:
-+        a, b = self._distance_operands(other)
-+        ab = (a & b).bit_count()
-+        if ab == 0:
-+            return 1.0
-+        return 1 - ab / (a.bit_count() + b.bit_count() - ab)
-+
-     def to_list(self) -> list[bool]:
-         # TODO improve
-         return [v != '0' for v in self.to_text()]
-@@ -78,6 +87,18 @@ class Bit:
-     def to_binary(self) -> bytes:
-         return pack('>i', self._length) + self._data
- 
-+    def _distance_operands(self, other: Bit | BitInput, /) -> tuple[int, int]:
-+        if not isinstance(other, Bit):
-+            other = Bit(other)
-+
-+        if self._length != other._length:
-+            raise ValueError(f'different bit lengths {self._length} and {other._length}')
-+
-+        return self._to_int(), other._to_int()
-+
-+    def _to_int(self) -> int:
-+        return int.from_bytes(self._data, byteorder='big') >> (8 * len(self._data) - self._length)
-+
-     @classmethod
-     def from_text(cls, value: str, /) -> Bit:
-         # cast to ensure always uses str constructor
-diff --git a/pgvector/vector.py b/pgvector/vector.py
-index d86cba0..b6e1d4b 100644
---- a/pgvector/vector.py
-+++ b/pgvector/vector.py
-@@ -1,13 +1,17 @@
- from __future__ import annotations
- from array import array
-+import math
-+from operator import sub
- import struct
- import sys
- from typing import TYPE_CHECKING
--from ._utils import is_ndarray, ndarray
-+from ._utils import float32_dot, float32_sum, ieee_divide, is_ndarray, ndarray
- 
- if TYPE_CHECKING:
-     import numpy as np
- 
-+_MAX_DIM = 16000
-+
- 
- class Vector:
-     _value: array[float]
-@@ -41,6 +45,29 @@ class Vector:
-     def dimensions(self) -> int:
-         return len(self._value)
- 
-+    def l2_distance(self, other: Vector | list[float] | ndarray, /) -> float:
-+        a, b = self._distance_operands(other)
-+        diff = array('f', map(sub, a, b))
-+        return math.sqrt(float32_dot(diff, diff))
-+
-+    def max_inner_product(self, other: Vector | list[float] | ndarray, /) -> float:
-+        a, b = self._distance_operands(other)
-+        return -float32_dot(a, b)
-+
-+    def cosine_distance(self, other: Vector | list[float] | ndarray, /) -> float:
-+        a, b = self._distance_operands(other)
-+        norm = math.sqrt(float32_dot(a, a) * float32_dot(b, b))
-+        similarity = ieee_divide(float32_dot(a, b), norm)
-+        if similarity > 1:
-+            similarity = 1.0
-+        elif similarity < -1:
-+            similarity = -1.0
-+        return 1.0 - similarity
-+
-+    def l1_distance(self, other: Vector | list[float] | ndarray, /) -> float:
-+        a, b = self._distance_operands(other)
-+        return float32_sum(map(abs, array('f', map(sub, a, b))))
-+
-     def to_list(self) -> list[float]:
-         return self._value.tolist()
- 
-@@ -84,6 +111,32 @@ class Vector:
-         vec._value = arr
-         return vec
- 
-+    def _distance_operands(self, other: Vector | list[float] | ndarray, /) -> tuple[array[float], array[float]]:
-+        if not isinstance(other, Vector):
-+            other = Vector(other)
-+
-+        self._check_distance_operand()
-+        other._check_distance_operand()
-+
-+        if len(self._value) != len(other._value):
-+            raise ValueError(f'different vector dimensions {len(self._value)} and {len(other._value)}')
-+
-+        return self._value, other._value
-+
-+    def _check_distance_operand(self) -> None:
-+        dim = len(self._value)
-+        if dim < 1:
-+            raise ValueError('vector must have at least 1 dimension')
-+        if dim > _MAX_DIM:
-+            raise ValueError(f'vector cannot have more than {_MAX_DIM} dimensions')
-+
-+        if not all(map(math.isfinite, self._value)):
-+            for v in self._value:
-+                if math.isnan(v):
-+                    raise ValueError('NaN not allowed in vector')
-+                if math.isinf(v):
-+                    raise ValueError('infinite value not allowed in vector')
-+
-     @classmethod
-     def _from_text(cls, value: str, /) -> list[float]:
-         if len(value) == 2:
-diff --git a/tests/test_bit.py b/tests/test_bit.py
-index 9179cd3..69f1e92 100644
---- a/tests/test_bit.py
-+++ b/tests/test_bit.py
-@@ -142,3 +142,94 @@ class TestBit:
-     def test_from_binary_negative_length(self) -> None:
-         with pytest.raises(ValueError, match='invalid length'):
-             Bit.from_binary(struct.pack('>i', -1))
-+
-+
-+class TestBitDistance:
-+    def test_hamming_distance(self) -> None:
-+        assert Bit('101').hamming_distance(Bit('011')) == 2.0
-+        assert Bit('101').hamming_distance(Bit('101')) == 0.0
-+        assert Bit('1111111100').hamming_distance(Bit('0000000011')) == 10.0
-+
-+    def test_jaccard_distance(self) -> None:
-+        assert Bit('101').jaccard_distance(Bit('011')) == 1 - 1 / 3
-+        assert Bit('101').jaccard_distance(Bit('101')) == 0.0
-+        assert Bit('100').jaccard_distance(Bit('010')) == 1.0
-+        assert Bit('1111111100').jaccard_distance(Bit('1000000011')) == 1 - 1 / 10
-+
-+    def test_return_type(self) -> None:
-+        assert type(Bit('101').hamming_distance(Bit('011'))) is float
-+        assert type(Bit('101').jaccard_distance(Bit('011'))) is float
-+        assert type(Bit('000').jaccard_distance(Bit('000'))) is float
-+
-+    def test_str(self) -> None:
-+        assert Bit('101').hamming_distance('011') == 2.0
-+        assert Bit('101').jaccard_distance('011') == 1 - 1 / 3
-+
-+    def test_list(self) -> None:
-+        assert Bit('101').hamming_distance([False, True, True]) == 2.0
-+        assert Bit('101').jaccard_distance([False, True, True]) == 1 - 1 / 3
-+
-+    def test_bytes(self) -> None:
-+        assert Bit('11110000').hamming_distance(b'\x0f') == 8.0
-+        assert Bit('11110000').jaccard_distance(b'\xff') == 0.5
-+        assert Bit(b'\xff\x00').hamming_distance(b'\x00\xff') == 16.0
-+
-+    def test_ndarray(self) -> None:
-+        if np is None:
-+            pytest.skip('NumPy required')
-+
-+        assert Bit('101').hamming_distance(np.array([False, True, True])) == 2.0
-+        assert Bit('101').jaccard_distance(np.array([False, True, True])) == 1 - 1 / 3
-+        assert Bit('101').hamming_distance(np.array([0, 1, 1], dtype=np.uint8)) == 2.0
-+
-+    def test_invalid_type(self) -> None:
-+        with pytest.raises(ValueError, match='expected bytes, str, list, or ndarray'):
-+            Bit('1').hamming_distance(1)  # type: ignore
-+
-+    def test_invalid_str(self) -> None:
-+        with pytest.raises(ValueError, match='expected bit string'):
-+            Bit('1').hamming_distance('2')
-+
-+    def test_different_lengths(self) -> None:
-+        for method in ['hamming_distance', 'jaccard_distance']:
-+            with pytest.raises(ValueError) as error:
-+                getattr(Bit('101'), method)('1')
-+            assert str(error.value) == 'different bit lengths 3 and 1'
-+
-+            with pytest.raises(ValueError) as error:
-+                getattr(Bit(b'\x00'), method)('101')
-+            assert str(error.value) == 'different bit lengths 8 and 3'
-+
-+            with pytest.raises(ValueError) as error:
-+                getattr(Bit(''), method)('0')
-+            assert str(error.value) == 'different bit lengths 0 and 1'
-+
-+    def test_empty(self) -> None:
-+        assert Bit('').hamming_distance('') == 0.0
-+        assert Bit('').jaccard_distance('') == 1.0
-+        assert Bit([]).hamming_distance(b'') == 0.0
-+
-+    def test_jaccard_distance_zeros(self) -> None:
-+        assert Bit('000').jaccard_distance('000') == 1.0
-+        assert Bit('000').jaccard_distance('011') == 1.0
-+
-+    def test_padding_bits(self) -> None:
-+        padded = Bit.from_binary(struct.pack('>iB', 3, 0xff))
-+        assert padded.hamming_distance('111') == 0.0
-+        assert padded.jaccard_distance('111') == 0.0
-+        assert padded.jaccard_distance('000') == 1.0
-+        assert Bit('111').hamming_distance(padded) == 0.0
-+
-+        padded = Bit.from_binary(struct.pack('>iBB', 9, 0x00, 0x7f))
-+        assert padded.hamming_distance('000000000') == 0.0
-+        assert padded.jaccard_distance('111111111') == 1.0
-+
-+    def test_random(self) -> None:
-+        length = random.randint(1, 2048)
-+        a = random.choices([True, False], k=length)
-+        b = random.choices([True, False], k=length)
-+        hamming = sum(x != y for x, y in zip(a, b))
-+        ab = sum(x and y for x, y in zip(a, b))
-+        jaccard = 1.0 if ab == 0 else 1 - ab / (sum(a) + sum(b) - ab)
-+        assert Bit(a).hamming_distance(b) == hamming
-+        assert Bit(a).jaccard_distance(b) == jaccard
-diff --git a/tests/test_distance.py b/tests/test_distance.py
-new file mode 100644
-index 0000000..0b4bf86
---- /dev/null
-+++ b/tests/test_distance.py
-@@ -0,0 +1,236 @@
-+from array import array
-+import math
-+from pgvector import Bit, Vector
-+from pgvector.psycopg import register_vector
-+import psycopg
-+import pytest
-+import random
-+import struct
-+from typing import Any
-+from .conftest import numpy as np
-+
-+conn = psycopg.connect(dbname='pgvector_python_test', autocommit=True)
-+
-+conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
-+
-+register_vector(conn)
-+
-+VECTOR_OPERATORS = {
-+    'l2_distance': '<->',
-+    'max_inner_product': '<#>',
-+    'cosine_distance': '<=>',
-+    'l1_distance': '<+>'
-+}
-+
-+BIT_OPERATORS = {
-+    'hamming_distance': '<~>',
-+    'jaccard_distance': '<%%>'
-+}
-+
-+VECTOR_CASES: list[tuple[list[float], list[float]]] = [
-+    ([1, 2, 3], [3, 1, 5]),
-+    ([1, 2, 3], [1, 2, 3]),
-+    ([1, 1], [-1, -1]),
-+    ([1, 0], [0, 1]),
-+    ([0.5, -0.25], [-2, 4]),
-+    ([0, 0], [0, 0]),
-+    ([0, 0], [1, 2]),
-+    ([0.0], [-0.0]),
-+    ([-0.0], [1]),
-+    ([1, 1], [1, -1]),
-+    ([16777216, 1], [0, 0]),
-+    ([16777216, 1], [1, 1]),
-+    ([0.1], [0]),
-+    ([3e38], [-3e38]),
-+    ([3e38, 3e38], [3e38, 3e38]),
-+    ([3e38], [3e38]),
-+    ([3e38], [1]),
-+    ([2e19], [0]),
-+    ([1e-30], [0]),
-+    ([1e-30], [1e-30]),
-+    ([1e-30], [1]),
-+    ([1e-30], [-1]),
-+    ([1e-30], [1e30]),
-+    ([1e-40], [0]),
-+    ([1e-20], [1e-20]),
-+    ([0.7, 0.7], [2.1, 2.1]),
-+    ([0.7, 0.7], [-2.1, -2.1])
-+]
-+
-+VECTOR_ERROR_CASES: list[tuple[list[float], list[float]]] = [
-+    ([1, 2], [1, 2, 3]),
-+    ([1, 2, 3], [1]),
-+    ([], []),
-+    ([], [1]),
-+    ([1], []),
-+    ([math.nan], [1]),
-+    ([1], [math.nan]),
-+    ([math.inf], [1]),
-+    ([1], [-math.inf]),
-+    ([1, math.inf, math.nan], [1, 2, 3]),
-+    ([1, math.nan, math.inf], [1, 2, 3]),
-+    ([1e39], [1]),
-+    ([1, 2], [math.nan]),
-+    ([0.0] * 16001, [0.0] * 16001)
-+]
-+
-+BIT_CASES = [
-+    ('101', '011'),
-+    ('101', '101'),
-+    ('100', '010'),
-+    ('000', '000'),
-+    ('000', '011'),
-+    ('', ''),
-+    ('1111111100', '1000000011'),
-+    ('1' * 100, '0' * 50 + '1' * 50)
-+]
-+
-+
-+def sql_vector_distance(operator: str, a: Vector, b: Vector) -> Any:
-+    return conn.execute(f'SELECT %b {operator} %b', (a, b), binary=True).fetchone()[0]  # type: ignore
-+
-+
-+def sql_bit_distance(operator: str, a: Bit, b: Bit) -> Any:
-+    return conn.execute(f'SELECT %b {operator} %b', (a, b), binary=True).fetchone()[0]  # type: ignore
-+
-+
-+def assert_same_float(actual: float, expected: Any) -> None:
-+    assert type(actual) is float
-+    assert type(expected) is float
-+    if math.isnan(expected):
-+        assert math.isnan(actual)
-+    else:
-+        assert actual == expected
-+        assert math.copysign(1, actual) == math.copysign(1, expected)
-+
-+
-+class TestVectorDistance:
-+    @pytest.mark.parametrize('method', VECTOR_OPERATORS.keys())
-+    @pytest.mark.parametrize('a,b', VECTOR_CASES)
-+    def test_matches_sql(self, method: str, a: list[float], b: list[float]) -> None:
-+        va = Vector(a)
-+        vb = Vector(b)
-+        expected = sql_vector_distance(VECTOR_OPERATORS[method], va, vb)
-+        assert_same_float(getattr(va, method)(vb), expected)
-+        assert_same_float(getattr(va, method)(b), expected)
-+
-+    @pytest.mark.parametrize('method', VECTOR_OPERATORS.keys())
-+    @pytest.mark.parametrize('a,b', VECTOR_CASES)
-+    def test_matches_sql_text_format(self, method: str, a: list[float], b: list[float]) -> None:
-+        va = Vector(a)
-+        vb = Vector(b)
-+        expected = conn.execute(f'SELECT %t::vector {VECTOR_OPERATORS[method]} %t::vector', (va, vb)).fetchone()[0]  # type: ignore
-+        assert_same_float(getattr(va, method)(vb), expected)
-+
-+    @pytest.mark.parametrize('method', VECTOR_OPERATORS.keys())
-+    @pytest.mark.parametrize('a,b', VECTOR_CASES)
-+    def test_matches_sql_function(self, method: str, a: list[float], b: list[float]) -> None:
-+        va = Vector(a)
-+        vb = Vector(b)
-+        if method == 'max_inner_product':
-+            sql = 'SELECT -inner_product(%b, %b)'
-+        else:
-+            sql = f'SELECT {method}(%b, %b)'
-+        expected = conn.execute(sql, (va, vb), binary=True).fetchone()[0]  # type: ignore
-+        assert_same_float(getattr(va, method)(vb), expected)
-+
-+    @pytest.mark.parametrize('method', VECTOR_OPERATORS.keys())
-+    @pytest.mark.parametrize('a,b', VECTOR_ERROR_CASES)
-+    def test_errors_match_sql(self, method: str, a: list[float], b: list[float]) -> None:
-+        va = Vector(a)
-+        vb = Vector(b)
-+
-+        with pytest.raises(ValueError) as error:
-+            getattr(va, method)(vb)
-+
-+        with pytest.raises(psycopg.Error) as sql_error:
-+            sql_vector_distance(VECTOR_OPERATORS[method], va, vb)
-+
-+        assert str(error.value) == sql_error.value.diag.message_primary
-+
-+    @pytest.mark.parametrize('method', VECTOR_OPERATORS.keys())
-+    @pytest.mark.parametrize('dim', [1, 3, 7, 8, 9, 16, 100, 1000])
-+    def test_random(self, method: str, dim: int) -> None:
-+        rng = random.Random(dim)
-+        for _ in range(10):
-+            a = Vector([rng.uniform(-1, 1) for _ in range(dim)])
-+            b = Vector([rng.uniform(-1, 1) for _ in range(dim)])
-+            expected = sql_vector_distance(VECTOR_OPERATORS[method], a, b)
-+            assert getattr(a, method)(b) == pytest.approx(expected, rel=1e-5, abs=dim * 1e-6)
-+
-+    @pytest.mark.parametrize('method', VECTOR_OPERATORS.keys())
-+    def test_random_exact(self, method: str) -> None:
-+        rng = random.Random(0)
-+        for _ in range(20):
-+            dim = rng.randint(1, 64)
-+            a = Vector([rng.randint(-16, 16) for _ in range(dim)])
-+            b = Vector([rng.randint(-16, 16) for _ in range(dim)])
-+            expected = sql_vector_distance(VECTOR_OPERATORS[method], a, b)
-+            assert_same_float(getattr(a, method)(b), expected)
-+
-+    def test_ndarray(self) -> None:
-+        if np is None:
-+            pytest.skip('NumPy required')
-+
-+        a = Vector([1, 2, 3])
-+        b = np.array([0.1, 0.2, 0.3])
-+        for method, operator in VECTOR_OPERATORS.items():
-+            expected = conn.execute(f'SELECT %b {operator} %b', (a, b), binary=True).fetchone()[0]  # type: ignore
-+            assert getattr(a, method)(b) == pytest.approx(expected, rel=1e-6)
-+
-+    def test_float32_rounding(self) -> None:
-+        value = array('f', [0.1])[0]
-+        assert value != 0.1
-+        assert Vector([0.1]).l1_distance([0]) == value
-+        assert sql_vector_distance('<+>', Vector([0.1]), Vector([0])) == value
-+
-+
-+class TestBitDistance:
-+    @pytest.mark.parametrize('method', BIT_OPERATORS.keys())
-+    @pytest.mark.parametrize('a,b', BIT_CASES)
-+    def test_matches_sql(self, method: str, a: str, b: str) -> None:
-+        expected = sql_bit_distance(BIT_OPERATORS[method], Bit(a), Bit(b))
-+        assert_same_float(getattr(Bit(a), method)(Bit(b)), expected)
-+        assert_same_float(getattr(Bit(a), method)(b), expected)
-+
-+    @pytest.mark.parametrize('method', BIT_OPERATORS.keys())
-+    @pytest.mark.parametrize('a,b', BIT_CASES)
-+    def test_matches_sql_function(self, method: str, a: str, b: str) -> None:
-+        expected = conn.execute(f'SELECT {method}(%b, %b)', (Bit(a), Bit(b)), binary=True).fetchone()[0]  # type: ignore
-+        assert_same_float(getattr(Bit(a), method)(Bit(b)), expected)
-+
-+    @pytest.mark.parametrize('method', BIT_OPERATORS.keys())
-+    @pytest.mark.parametrize('a,b', [('101', '1'), ('', '0'), ('1', '')])
-+    def test_errors_match_sql(self, method: str, a: str, b: str) -> None:
-+        with pytest.raises(ValueError) as error:
-+            getattr(Bit(a), method)(Bit(b))
-+
-+        with pytest.raises(psycopg.Error) as sql_error:
-+            sql_bit_distance(BIT_OPERATORS[method], Bit(a), Bit(b))
-+
-+        assert str(error.value) == sql_error.value.diag.message_primary
-+
-+    @pytest.mark.parametrize('method', BIT_OPERATORS.keys())
-+    def test_bytes(self, method: str) -> None:
-+        a = Bit(b'\xf0\x0f')
-+        b = Bit(b'\xff\x00')
-+        expected = sql_bit_distance(BIT_OPERATORS[method], a, b)
-+        assert_same_float(getattr(a, method)(b'\xff\x00'), expected)
-+
-+    @pytest.mark.parametrize('method', BIT_OPERATORS.keys())
-+    def test_padding_bits(self, method: str) -> None:
-+        padded = Bit.from_binary(struct.pack('>iB', 3, 0xff))
-+        for other in ['111', '000', '101']:
-+            expected = sql_bit_distance(BIT_OPERATORS[method], padded, Bit(other))
-+            assert_same_float(getattr(padded, method)(other), expected)
-+            assert_same_float(getattr(Bit(other), method)(padded), expected)
-+
-+    @pytest.mark.parametrize('method', BIT_OPERATORS.keys())
-+    def test_random(self, method: str) -> None:
-+        rng = random.Random(0)
-+        for _ in range(20):
-+            length = rng.randint(1, 2048)
-+            a = Bit(''.join(rng.choices('01', k=length)))
-+            b = Bit(''.join(rng.choices('01', k=length)))
-+            expected = sql_bit_distance(BIT_OPERATORS[method], a, b)
-+            assert_same_float(getattr(a, method)(b), expected)
-diff --git a/tests/test_vector.py b/tests/test_vector.py
-index 13a9cc7..3c681ef 100644
---- a/tests/test_vector.py
-+++ b/tests/test_vector.py
-@@ -1,3 +1,5 @@
-+from array import array
-+import math
- from pgvector import Vector
- import pytest
- import struct
-@@ -136,3 +138,178 @@ class TestVector:
-     def test_from_binary_non_zero_unused(self) -> None:
-         with pytest.raises(ValueError, match='expected unused to be 0'):
-             Vector.from_binary(struct.pack('>hh', 0, 1))
-+
-+
-+class TestVectorDistance:
-+    def test_l2_distance(self) -> None:
-+        assert Vector([1, 2, 3]).l2_distance(Vector([3, 1, 5])) == 3.0
-+        assert Vector([1, 1]).l2_distance(Vector([0, 0])) == math.sqrt(2)
-+
-+    def test_max_inner_product(self) -> None:
-+        assert Vector([1, 2, 3]).max_inner_product(Vector([3, 1, 5])) == -20.0
-+        assert Vector([1, -2]).max_inner_product(Vector([1, 1])) == 1.0
-+
-+    def test_cosine_distance(self) -> None:
-+        assert Vector([1, 2, 3]).cosine_distance(Vector([3, 1, 5])) == 1 - 20 / math.sqrt(14 * 35)
-+        assert Vector([1, 0]).cosine_distance(Vector([0, 1])) == 1.0
-+        assert Vector([1, 1]).cosine_distance(Vector([1, 1])) == 0.0
-+        assert Vector([1, 1]).cosine_distance(Vector([-1, -1])) == 2.0
-+
-+    def test_l1_distance(self) -> None:
-+        assert Vector([1, 2, 3]).l1_distance(Vector([3, 1, 5])) == 5.0
-+
-+    def test_return_type(self) -> None:
-+        a = Vector([1, 2, 3])
-+        b = Vector([3, 1, 5])
-+        for distance in [a.l2_distance(b), a.max_inner_product(b), a.cosine_distance(b), a.l1_distance(b)]:
-+            assert type(distance) is float
-+
-+    def test_list(self) -> None:
-+        a = Vector([1, 2, 3])
-+        assert a.l2_distance([3, 1, 5]) == 3.0
-+        assert a.max_inner_product([3, 1, 5]) == -20.0
-+        assert a.cosine_distance([3, 1, 5]) == a.cosine_distance(Vector([3, 1, 5]))
-+        assert a.l1_distance([3, 1, 5]) == 5.0
-+
-+    def test_ndarray(self) -> None:
-+        if np is None:
-+            pytest.skip('NumPy required')
-+
-+        a = Vector([1, 2, 3])
-+        b = np.array([3, 1, 5], dtype=np.float64)
-+        assert a.l2_distance(b) == 3.0
-+        assert a.max_inner_product(b) == -20.0
-+        assert a.cosine_distance(b) == a.cosine_distance(Vector([3, 1, 5]))
-+        assert a.l1_distance(b) == 5.0
-+
-+    def test_ndarray_float32_rounding(self) -> None:
-+        if np is None:
-+            pytest.skip('NumPy required')
-+
-+        assert Vector([0]).l1_distance(np.array([0.1])) == float(np.float32(0.1))
-+
-+    def test_invalid_type(self) -> None:
-+        with pytest.raises(ValueError, match='expected list or ndarray'):
-+            Vector([1]).l2_distance(1)  # type: ignore
-+
-+    def test_different_dimensions(self) -> None:
-+        for method in DISTANCE_METHODS:
-+            with pytest.raises(ValueError) as error:
-+                getattr(Vector([1, 2]), method)([1, 2, 3])
-+            assert str(error.value) == 'different vector dimensions 2 and 3'
-+
-+    def test_empty(self) -> None:
-+        for method in DISTANCE_METHODS:
-+            for a, b in cases(([], []), ([], [1.0]), ([1.0], [])):
-+                with pytest.raises(ValueError) as error:
-+                    getattr(Vector(a), method)(b)
-+                assert str(error.value) == 'vector must have at least 1 dimension'
-+
-+    def test_too_many_dimensions(self) -> None:
-+        assert Vector([0.0] * 16000).l1_distance([0.0] * 16000) == 0.0
-+        with pytest.raises(ValueError) as error:
-+            Vector([0.0] * 16001).l1_distance([0.0] * 16001)
-+        assert str(error.value) == 'vector cannot have more than 16000 dimensions'
-+
-+    def test_nan(self) -> None:
-+        for method in DISTANCE_METHODS:
-+            for a, b in cases(([math.nan], [1.0]), ([1.0], [math.nan])):
-+                with pytest.raises(ValueError) as error:
-+                    getattr(Vector(a), method)(b)
-+                assert str(error.value) == 'NaN not allowed in vector'
-+
-+    def test_infinity(self) -> None:
-+        for method in DISTANCE_METHODS:
-+            for a, b in cases(([math.inf], [1.0]), ([1.0], [-math.inf])):
-+                with pytest.raises(ValueError) as error:
-+                    getattr(Vector(a), method)(b)
-+                assert str(error.value) == 'infinite value not allowed in vector'
-+
-+    def test_first_invalid_element(self) -> None:
-+        with pytest.raises(ValueError, match='infinite value not allowed in vector'):
-+            Vector([1, math.inf, math.nan]).l2_distance([1, 2, 3])
-+        with pytest.raises(ValueError, match='NaN not allowed in vector'):
-+            Vector([1, math.nan, math.inf]).l2_distance([1, 2, 3])
-+
-+    def test_out_of_range_element(self) -> None:
-+        with pytest.raises(ValueError, match='infinite value not allowed in vector'):
-+            Vector([1e39]).l2_distance([1])
-+
-+    def test_validation_before_dimensions(self) -> None:
-+        with pytest.raises(ValueError, match='NaN not allowed in vector'):
-+            Vector([1, 2]).l2_distance([math.nan])
-+
-+    def test_cosine_distance_zero_vector(self) -> None:
-+        assert math.isnan(Vector([0, 0]).cosine_distance([0, 0]))
-+        assert math.isnan(Vector([0, 0]).cosine_distance([1, 2]))
-+        assert math.isnan(Vector([1, 2]).cosine_distance([0, 0]))
-+
-+    def test_cosine_distance_clamp(self) -> None:
-+        assert Vector([0.7, 0.7]).cosine_distance([2.1, 2.1]) == 0.0
-+        assert Vector([0.7, 0.7]).cosine_distance([-2.1, -2.1]) == 2.0
-+
-+    def test_float32_accumulation(self) -> None:
-+        assert Vector([16777216, 1]).l1_distance([0, 0]) == 16777216.0
-+        assert Vector([16777216, 1]).max_inner_product([1, 1]) == -16777216.0
-+        assert Vector([16777216, 1]).l2_distance([0, 0]) == 16777216.0
-+        assert Vector([0.1]).l1_distance([0]) == float(array('f', [0.1])[0])
-+
-+    def test_float32_overflow(self) -> None:
-+        assert Vector([3e38]).l2_distance([-3e38]) == math.inf
-+        assert Vector([3e38]).l1_distance([-3e38]) == math.inf
-+        assert Vector([2e19]).l2_distance([0]) == math.inf
-+        assert Vector([3e38, 3e38]).max_inner_product([3e38, 3e38]) == -math.inf
-+        assert Vector([3e38]).max_inner_product([-3e38]) == math.inf
-+        assert math.isnan(Vector([3e38, 3e38]).max_inner_product([3e38, -3e38]))
-+        assert math.isnan(Vector([3e38]).cosine_distance([3e38]))
-+        assert Vector([3e38]).cosine_distance([1]) == 1.0
-+
-+    def test_float32_underflow(self) -> None:
-+        assert Vector([1e-30]).l2_distance([0]) == 0.0
-+        assert is_negative_zero(Vector([1e-30]).max_inner_product([1e-30]))
-+        assert math.isnan(Vector([1e-30]).cosine_distance([1e-30]))
-+        assert Vector([1e-30]).cosine_distance([1]) == 0.0
-+        assert Vector([1e-30]).cosine_distance([-1]) == 2.0
-+        assert math.isnan(Vector([1e-30]).cosine_distance([1e30]))
-+
-+    def test_subnormal(self) -> None:
-+        subnormal = array('f', [1e-40])[0]
-+        assert 0 < subnormal < 1.1754943508222875e-38
-+        assert Vector([1e-40]).l1_distance([0]) == subnormal
-+        assert Vector([1e-20]).l2_distance([0]) == math.sqrt(array('f', [1e-40])[0])
-+        assert Vector([1e-20]).max_inner_product([1e-20]) == -array('f', [1e-40])[0]
-+
-+    def test_signed_zero(self) -> None:
-+        assert is_positive_zero(Vector([-0.0]).l2_distance([0.0]))
-+        assert is_positive_zero(Vector([-0.0]).l1_distance([0.0]))
-+        assert is_positive_zero(Vector([1, 2]).l2_distance([1, 2]))
-+        assert is_positive_zero(Vector([1, 2]).l1_distance([1, 2]))
-+        assert is_positive_zero(Vector([1, 1]).cosine_distance([1, 1]))
-+        assert is_negative_zero(Vector([0.0]).max_inner_product([0.0]))
-+        assert is_negative_zero(Vector([-0.0]).max_inner_product([0.0]))
-+        assert is_negative_zero(Vector([-1.0]).max_inner_product([0.0]))
-+        assert is_negative_zero(Vector([1, 1]).max_inner_product([1, -1]))
-+        assert math.isnan(Vector([-0.0]).cosine_distance([1]))
-+
-+    def test_does_not_modify(self) -> None:
-+        a = Vector([1, 2, 3])
-+        b = [3.0, 1.0, 5.0]
-+        for method in DISTANCE_METHODS:
-+            getattr(a, method)(b)
-+        assert a == Vector([1, 2, 3])
-+        assert b == [3.0, 1.0, 5.0]
-+
-+
-+DISTANCE_METHODS = ['l2_distance', 'max_inner_product', 'cosine_distance', 'l1_distance']
-+
-+
-+def cases(*values: tuple[list[float], list[float]]) -> list[tuple[list[float], list[float]]]:
-+    return list(values)
-+
-+
-+def is_positive_zero(value: float) -> bool:
-+    return value == 0 and math.copysign(1, value) == 1
-+
-+
-+def is_negative_zero(value: float) -> bool:
-+    return value == 0 and math.copysign(1, value) == -1
+     def _collect_subqueries_in_set_expression(self, segment: BaseSegment):
+         subqueries = []
+diff --git a/tests/sql/column/test_column_select_union_dialect_specific.py b/tests/sql/column/test_column_select_union_dialect_specific.py
+index 7237342..20fda46 100644
+--- a/tests/sql/column/test_column_select_union_dialect_specific.py
++++ b/tests/sql/column/test_column_select_union_dialect_specific.py
+@@ -214,3 +214,80 @@ FROM (SELECT col1, col2
+         dialect=dialect,
+         test_sqlparse=False,
+     )
++
++
++@pytest.mark.parametrize("dialect", ["duckdb", "snowflake"])
++def test_union_all_by_name_with_new_columns_and_column_specified_in_dml(dialect: str):
++    sql = """INSERT INTO tab3 (col4, col5, col6)
++SELECT col1, col2
++FROM tab1
++UNION ALL BY NAME
++SELECT col3, col1
++FROM tab2"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (
++                ColumnQualifierTuple("col1", "tab1"),
++                ColumnQualifierTuple("col4", "tab3"),
++            ),
++            (
++                ColumnQualifierTuple("col2", "tab1"),
++                ColumnQualifierTuple("col5", "tab3"),
++            ),
++            (
++                ColumnQualifierTuple("col1", "tab2"),
++                ColumnQualifierTuple("col4", "tab3"),
++            ),
++            (
++                ColumnQualifierTuple("col3", "tab2"),
++                ColumnQualifierTuple("col6", "tab3"),
++            ),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
++
++
++@pytest.mark.parametrize("dialect", ["duckdb", "snowflake"])
++def test_union_all_with_nested_union_all_by_name(dialect: str):
++    sql = """INSERT INTO tab4
++SELECT col1, col2
++FROM tab1
++UNION ALL
++(SELECT col2, col1
++ FROM tab2
++ UNION ALL BY NAME
++ SELECT col1, col2
++ FROM tab3)"""
++    assert_column_lineage_equal(
++        sql,
++        [
++            (
++                ColumnQualifierTuple("col1", "tab1"),
++                ColumnQualifierTuple("col1", "tab4"),
++            ),
++            (
++                ColumnQualifierTuple("col2", "tab1"),
++                ColumnQualifierTuple("col2", "tab4"),
++            ),
++            (
++                ColumnQualifierTuple("col2", "tab2"),
++                ColumnQualifierTuple("col1", "tab4"),
++            ),
++            (
++                ColumnQualifierTuple("col1", "tab2"),
++                ColumnQualifierTuple("col2", "tab4"),
++            ),
++            (
++                ColumnQualifierTuple("col2", "tab3"),
++                ColumnQualifierTuple("col1", "tab4"),
++            ),
++            (
++                ColumnQualifierTuple("col1", "tab3"),
++                ColumnQualifierTuple("col2", "tab4"),
++            ),
++        ],
++        dialect=dialect,
++        test_sqlparse=False,
++    )
