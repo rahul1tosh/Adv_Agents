@@ -1,633 +1,313 @@
-diff --git a/pgvector/_utils.py b/pgvector/_utils.py
-index 4cafc32..5bcfb19 100644
---- a/pgvector/_utils.py
-+++ b/pgvector/_utils.py
-@@ -1,3 +1,4 @@
-+import struct
- import sys
- from typing import TYPE_CHECKING, TypeAlias
- 
-@@ -5,10 +6,14 @@ if TYPE_CHECKING:
-     import numpy as np
- 
-     ndarray: TypeAlias = np.ndarray[tuple[int, ...], np.dtype[np.floating]]
-+    bit_ndarray: TypeAlias = np.ndarray[tuple[int, ...], np.dtype[np.bool_ | np.uint8]]
- else:
-     # any value works since not type checking
-     # TODO use Never when Python 3.10 no longer supported
-     ndarray = None
-+    bit_ndarray = None
-+
-+_FLOAT32 = struct.Struct('f')
- 
- 
- def is_ndarray(value: object, /) -> bool:
-@@ -21,3 +26,7 @@ def is_sparse_array(value: object, /) -> bool:
-     if (sparse := sys.modules.get('scipy.sparse')):
-         return isinstance(value, (sparse.sparray, sparse.spmatrix))
-     return False
-+
-+
-+def to_float32(value: float, /) -> float:
-+    return float(_FLOAT32.unpack(_FLOAT32.pack(value))[0])
-diff --git a/pgvector/bit.py b/pgvector/bit.py
-index a9370e4..69c9d9f 100644
---- a/pgvector/bit.py
-+++ b/pgvector/bit.py
-@@ -1,7 +1,7 @@
- from __future__ import annotations
- from struct import pack, unpack_from
- from typing import TYPE_CHECKING
--from ._utils import is_ndarray
-+from ._utils import bit_ndarray, is_ndarray
- 
- if TYPE_CHECKING:
-     import numpy as np
-@@ -13,7 +13,7 @@ class Bit:
- 
-     def __init__(
-         self,
--        value: bytes | str | list[bool] | np.ndarray[tuple[int, ...], np.dtype[np.bool_ | np.uint8]],
-+        value: bytes | str | list[bool] | bit_ndarray,
-         /
-     ) -> None:
-         if isinstance(value, bytes):
-@@ -78,6 +78,25 @@ class Bit:
-     def to_binary(self) -> bytes:
-         return pack('>i', self._length) + self._data
- 
-+    def hamming_distance(self, other: Bit | bytes | str | list[bool] | bit_ndarray, /) -> float:
-+        a, b = self._prepare_distance(other)
-+        return float((a ^ b).bit_count())
-+
-+    def jaccard_distance(self, other: Bit | bytes | str | list[bool] | bit_ndarray, /) -> float:
-+        a, b = self._prepare_distance(other)
-+        ab = (a & b).bit_count()
-+        if ab == 0:
-+            return 1.0
-+        return 1.0 - ab / (a | b).bit_count()
-+
-+    def _prepare_distance(self, other: Bit | bytes | str | list[bool] | bit_ndarray, /) -> tuple[int, int]:
-+        if not isinstance(other, Bit):
-+            other = self.__class__(other)
-+        if self._length != other._length:
-+            raise ValueError(f'different bit lengths {self._length} and {other._length}')
-+        pad = (-self._length) & 7
-+        return int.from_bytes(self._data, 'big') >> pad, int.from_bytes(other._data, 'big') >> pad
-+
-     @classmethod
-     def from_text(cls, value: str, /) -> Bit:
-         # cast to ensure always uses str constructor
 diff --git a/pgvector/vector.py b/pgvector/vector.py
-index d86cba0..b8ba7b4 100644
+index d86cba0..a52eae4 100644
 --- a/pgvector/vector.py
 +++ b/pgvector/vector.py
-@@ -1,9 +1,10 @@
+@@ -1,9 +1,11 @@
  from __future__ import annotations
  from array import array
 +import math
  import struct
  import sys
  from typing import TYPE_CHECKING
--from ._utils import is_ndarray, ndarray
-+from ._utils import is_ndarray, ndarray, to_float32
+ from ._utils import is_ndarray, ndarray
++from .bit import Bit
  
  if TYPE_CHECKING:
      import numpy as np
-@@ -60,6 +61,72 @@ class Vector:
-         # TODO change to >hh in 0.6.0
-         return struct.pack('>HH', len(value), 0) + memoryview(value)
+@@ -38,6 +40,74 @@ class Vector:
+             return NotImplemented
+         return self._value == other._value
  
-+    def l2_distance(self, other: list[float] | ndarray | Vector, /) -> float:
-+        a, b = self._prepare_distance(other)
-+        distance = 0.0
-+        for x, y in zip(a, b):
-+            diff = to_float32(x - y)
-+            distance = to_float32(distance + to_float32(diff * diff))
-+        return math.sqrt(distance)
-+
-+    def max_inner_product(self, other: list[float] | ndarray | Vector, /) -> float:
-+        a, b = self._prepare_distance(other)
-+        distance = 0.0
-+        for x, y in zip(a, b):
-+            distance = to_float32(distance + to_float32(x * y))
-+        return -distance
-+
-+    def cosine_distance(self, other: list[float] | ndarray | Vector, /) -> float:
-+        a, b = self._prepare_distance(other)
-+        similarity = 0.0
-+        norma = 0.0
-+        normb = 0.0
-+        for x, y in zip(a, b):
-+            similarity = to_float32(similarity + to_float32(x * y))
-+            norma = to_float32(norma + to_float32(x * x))
-+            normb = to_float32(normb + to_float32(y * y))
-+        norm_product = norma * normb
-+        if math.isnan(norm_product):
-+            return math.nan
-+        denom = math.sqrt(norm_product)
-+        if denom == 0.0:
-+            if similarity == 0.0 or math.isnan(similarity):
-+                return math.nan
-+            result = math.copysign(math.inf, similarity)
-+        else:
-+            result = similarity / denom
-+        if result > 1.0:
-+            return 0.0
-+        if result < -1.0:
-+            return 2.0
-+        return 1.0 - result
-+
-+    def l1_distance(self, other: list[float] | ndarray | Vector, /) -> float:
-+        a, b = self._prepare_distance(other)
-+        distance = 0.0
-+        for x, y in zip(a, b):
-+            distance = to_float32(distance + abs(to_float32(x - y)))
-+        return distance
-+
-+    def _prepare_distance(self, other: list[float] | ndarray | Vector, /) -> tuple[array[float], array[float]]:
++    def __add__(self, other: Vector, /) -> Vector:
 +        if not isinstance(other, Vector):
-+            other = self.__class__(other)
-+        self._validate_values(self._value)
-+        self._validate_values(other._value)
++            return NotImplemented
 +        if len(self._value) != len(other._value):
 +            raise ValueError(f'different vector dimensions {len(self._value)} and {len(other._value)}')
-+        return self._value, other._value
-+
-+    @staticmethod
-+    def _validate_values(values: array[float], /) -> None:
-+        if len(values) == 0:
-+            raise ValueError('vector must have at least 1 dimension')
-+        for v in values:
-+            if math.isnan(v):
-+                raise ValueError('NaN not allowed in vector')
++        res = array('f', (a + b for a, b in zip(self._value, other._value)))
++        for v in res:
 +            if math.isinf(v):
-+                raise ValueError('infinite value not allowed in vector')
++                raise ValueError('value out of range')
++        return self._from_array(res)
++
++    def __sub__(self, other: Vector, /) -> Vector:
++        if not isinstance(other, Vector):
++            return NotImplemented
++        if len(self._value) != len(other._value):
++            raise ValueError(f'different vector dimensions {len(self._value)} and {len(other._value)}')
++        res = array('f', (a - b for a, b in zip(self._value, other._value)))
++        for v in res:
++            if math.isinf(v):
++                raise ValueError('value out of range')
++        return self._from_array(res)
++
++    def __mul__(self, other: Vector, /) -> Vector:
++        if not isinstance(other, Vector):
++            return NotImplemented
++        if len(self._value) != len(other._value):
++            raise ValueError(f'different vector dimensions {len(self._value)} and {len(other._value)}')
++        res = array('f', (a * b for a, b in zip(self._value, other._value)))
++        for a, b, v in zip(self._value, other._value, res):
++            if math.isinf(v):
++                raise ValueError('value out of range')
++            if v == 0 and not (a == 0 or b == 0):
++                raise ValueError('value out of range: underflow')
++        return self._from_array(res)
++
++    def concat(self, other: Vector) -> Vector:
++        if not isinstance(other, Vector):
++            raise TypeError('expected Vector')
++        if len(self._value) + len(other._value) > 16000:
++            raise ValueError('vector cannot have more than 16000 dimensions')
++        return self._from_array(self._value + other._value)
++
++    def l2_normalize(self) -> Vector:
++        norm = math.sqrt(sum((v * v for v in self._value), 0.0))
++        if norm == 0:
++            return self._from_array(array('f', [0.0]) * len(self._value))
++        res = array('f', (v / norm for v in self._value))
++        for v in res:
++            if math.isinf(v):
++                raise ValueError('value out of range')
++        return self._from_array(res)
++
++    def binary_quantize(self) -> Bit:
++        return Bit(''.join('1' if v > 0 else '0' for v in self._value))
++
++    def subvector(self, start: int, count: int) -> Vector:
++        n = len(self._value)
++        if count < 1:
++            raise ValueError('vector must have at least 1 dimension')
++        end = min(start + count, n + 1)
++        if start < 1:
++            start = 1
++        elif start > n:
++            raise ValueError('vector must have at least 1 dimension')
++        if end <= start:
++            raise ValueError('vector must have at least 1 dimension')
++        return self._from_array(self._value[start - 1:end - 1])
++
+     def dimensions(self) -> int:
+         return len(self._value)
+ 
+@@ -84,6 +154,12 @@ class Vector:
+         vec._value = arr
+         return vec
+ 
++    @classmethod
++    def _from_array(cls, value: array[float], /) -> Vector:
++        vec = cls.__new__(cls)
++        vec._value = value
++        return vec
 +
      @classmethod
-     def from_text(cls, value: str, /) -> Vector:
-         return cls(cls._from_text(value))
-diff --git a/tests/test_bit.py b/tests/test_bit.py
-index 9179cd3..4f0a056 100644
---- a/tests/test_bit.py
-+++ b/tests/test_bit.py
-@@ -1,3 +1,4 @@
-+import math
- from pgvector import Bit
- import pytest
- import random
-@@ -142,3 +143,100 @@ class TestBit:
-     def test_from_binary_negative_length(self) -> None:
-         with pytest.raises(ValueError, match='invalid length'):
-             Bit.from_binary(struct.pack('>i', -1))
-+
-+    def test_hamming_distance(self) -> None:
-+        res = Bit('10101').hamming_distance(Bit('11001'))
-+        assert isinstance(res, float)
-+        assert res == 2.0
-+        same = Bit('10101').hamming_distance(Bit('10101'))
-+        assert same == 0.0
-+        assert math.copysign(1.0, same) == 1.0
-+        assert Bit('000').hamming_distance(Bit('000')) == 0.0
-+        assert Bit('111').hamming_distance(Bit('000')) == 3.0
-+        assert Bit('101010101').hamming_distance(Bit('010101010')) == 9.0
-+
-+    def test_jaccard_distance(self) -> None:
-+        res = Bit('10101').jaccard_distance(Bit('11001'))
-+        assert isinstance(res, float)
-+        assert res == 0.5
-+        assert Bit('11100').jaccard_distance(Bit('10000')) == 1.0 - 1 / 3
-+        same = Bit('101').jaccard_distance(Bit('101'))
-+        assert same == 0.0
-+        assert math.copysign(1.0, same) == 1.0
-+        assert Bit('101').jaccard_distance(Bit('010')) == 1.0
-+        assert Bit('000').jaccard_distance(Bit('000')) == 1.0
-+
-+    def test_distance_empty(self) -> None:
-+        empty = Bit('')
-+        h = empty.hamming_distance(empty)
-+        j = empty.jaccard_distance(empty)
-+        assert isinstance(h, float) and h == 0.0 and math.copysign(1.0, h) == 1.0
-+        assert isinstance(j, float) and j == 1.0
-+        assert empty.hamming_distance('') == 0.0
-+        assert empty.jaccard_distance(b'') == 1.0
-+        assert empty.hamming_distance([]) == 0.0
-+        assert empty.jaccard_distance([]) == 1.0
-+
-+    def test_distance_input_forms(self) -> None:
-+        a = Bit('10101010')
-+        assert a.hamming_distance('11110000') == 4.0
-+        assert a.jaccard_distance('11110000') == 1.0 - 2 / 6
-+        assert a.hamming_distance(b'\xf0') == 4.0
-+        assert a.jaccard_distance(b'\xf0') == 1.0 - 2 / 6
-+        assert Bit('101').hamming_distance([True, False, False]) == 1.0
-+        assert Bit('101').jaccard_distance([True, False, False]) == 0.5
-+
-+        if np is None:
-+            pytest.skip('NumPy required')
-+
-+        assert Bit('101').hamming_distance(np.array([True, False, False])) == 1.0
-+        assert Bit('101').jaccard_distance(np.array([True, False, False])) == 0.5
-+        unpacked = np.unpackbits(np.array([254, 7, 0], dtype=np.uint8))
-+        assert Bit(b'\xfe\x07\x00').hamming_distance(unpacked) == 0.0
-+        assert Bit(b'\xfe\x07\x00').jaccard_distance(unpacked) == 0.0
-+
-+    def test_distance_invalid_input(self) -> None:
-+        a = Bit('101')
-+        with pytest.raises(ValueError, match='expected bit string'):
-+            a.hamming_distance('201')
-+        with pytest.raises(ValueError, match='expected list\\[bool\\]'):
-+            a.jaccard_distance([254, 7, 0])  # type: ignore
-+        with pytest.raises(ValueError, match='expected bytes, str, list, or ndarray'):
-+            a.hamming_distance(True)  # type: ignore
-+        if np is not None:
-+            with pytest.raises(ValueError, match='expected elements to be boolean'):
-+                a.jaccard_distance(np.array([254, 7, 0], dtype=np.uint8))
-+
-+    def test_distance_different_lengths(self) -> None:
-+        cases: list[tuple[Bit, Bit | bytes, str]] = [
-+            (Bit('101'), Bit('1010'), 'different bit lengths 3 and 4'),
-+            (Bit(''), Bit('0'), 'different bit lengths 0 and 1'),
-+            (Bit('101'), b'\xff', 'different bit lengths 3 and 8'),
-+        ]
-+        for a, b, msg in cases:
-+            with pytest.raises(ValueError) as error:
-+                a.hamming_distance(b)
-+            assert str(error.value) == msg
-+            with pytest.raises(ValueError) as error:
-+                a.jaccard_distance(b)
-+            assert str(error.value) == msg
-+
-+    def test_distance_padding_bits(self) -> None:
-+        clean = Bit('101')
-+        dirty = Bit.from_binary(struct.pack('>iB', 3, 0b10111111))
-+        dirty_other = Bit.from_binary(struct.pack('>iB', 3, 0b10010101))
-+        assert dirty.hamming_distance(clean) == 0.0
-+        assert clean.hamming_distance(dirty) == 0.0
-+        assert dirty.jaccard_distance(clean) == 0.0
-+        assert clean.jaccard_distance(dirty) == 0.0
-+        assert dirty.hamming_distance(dirty_other) == 1.0
-+        assert dirty.jaccard_distance(dirty_other) == 0.5
-+
-+        zero_a = Bit.from_binary(struct.pack('>iB', 3, 0b00011111))
-+        zero_b = Bit.from_binary(struct.pack('>iB', 3, 0b00010101))
-+        assert zero_a.hamming_distance(zero_b) == 0.0
-+        assert zero_a.jaccard_distance(zero_b) == 1.0
-+
-+        multi_dirty = Bit.from_binary(struct.pack('>iBB', 9, 0b10101010, 0b11111111))
-+        assert multi_dirty.hamming_distance('101010101') == 0.0
-+        assert multi_dirty.jaccard_distance('101010101') == 0.0
-diff --git a/tests/test_psycopg.py b/tests/test_psycopg.py
-index 04863e9..5889773 100644
---- a/tests/test_psycopg.py
-+++ b/tests/test_psycopg.py
-@@ -1,9 +1,11 @@
-+import math
- from pgvector import Bit, HalfVector, SparseVector, Vector
- from pgvector.psycopg import register_vector, register_vector_async
- import psycopg
- from psycopg import Connection, AsyncConnection
- from psycopg_pool import ConnectionPool, AsyncConnectionPool
- import pytest
-+import struct
- from typing import Any
- from .conftest import numpy as np
- 
-@@ -234,3 +236,144 @@ class TestPsycopg:
-                 assert res == (Vector([1, 2, 3]),)
- 
-         await pool.close()
-+
-+    def test_vector_distances_match_postgres(self) -> None:
-+        cases: list[tuple[list[float], list[float]]] = [
-+            ([1, 2, 3], [4, 5, 6]),
-+            ([1, 2, 3], [1, 2, 3]),
-+            ([1, 2, 3], [-1, -2, -3]),
-+            ([0, 0, 0], [1, 2, 3]),
-+            ([0, 0, 0], [0, 0, 0]),
-+            ([-0.0], [0.0]),
-+            ([0.0], [-0.0]),
-+            ([-0.0], [-0.0]),
-+            ([1.0, 0.0], [0.0, 1.0]),
-+            ([1.0, -1.0], [1.0, 1.0]),
-+            ([0.4, 0.7, 1.0, 1.3, 1.6, 1.9, 2.2], [1.2, 2.1, 3.0, 3.9, 4.8, 5.7, 6.6]),
-+            ([0.4, 0.7, 1.0, 1.3, 1.6, 1.9, 2.2], [-1.2, -2.1, -3.0, -3.9, -4.8, -5.7, -6.6]),
-+            ([3e38], [-3e38]),
-+            ([3e38, 3e38], [0, 0]),
-+            ([1e20], [0]),
-+            ([1e20], [1e20]),
-+            ([1e20], [-1e20]),
-+            ([1e20], [1.0]),
-+            ([1e-25], [0]),
-+            ([1e-25], [1e-25]),
-+            ([1e-25], [1.0]),
-+            ([-1e-25], [1.0]),
-+            ([1e-25], [1e20]),
-+            ([1e-20], [0]),
-+            ([1e-20], [1e-20]),
-+            ([16777216.0, 1.0], [0.0, 0.0]),
-+            ([4096.0, 1.0], [0.0, 0.0]),
-+            ([16777216.0, 1.0], [1.0, 1.0]),
-+            ([float(i) * 0.25 for i in range(1, 17)], [float(17 - i) * 0.5 for i in range(1, 17)]),
-+        ]
-+
-+        for raw_a, raw_b in cases:
-+            a = Vector(raw_a)
-+            b = Vector(raw_b)
-+            row = conn.execute(
-+                'SELECT %b::vector <-> %b::vector, %b::vector <#> %b::vector, %b::vector <=> %b::vector, %b::vector <+> %b::vector',
-+                (a, b, a, b, a, b, a, b)
-+            ).fetchone()
-+            assert row is not None
-+            pg_results = (row[0], row[1], row[2], row[3])
-+            py_results = (
-+                a.l2_distance(b),
-+                a.max_inner_product(b),
-+                a.cosine_distance(b),
-+                a.l1_distance(b),
-+            )
-+            for pg_val, py_val in zip(pg_results, py_results):
-+                if math.isnan(pg_val):
-+                    assert math.isnan(py_val)
-+                elif math.isinf(pg_val):
-+                    assert math.isinf(py_val) and math.copysign(1.0, py_val) == math.copysign(1.0, pg_val)
-+                elif pg_val == 0.0:
-+                    assert py_val == 0.0 and math.copysign(1.0, py_val) == math.copysign(1.0, pg_val)
-+                else:
-+                    assert py_val == pytest.approx(pg_val, rel=1e-6, abs=1e-7)
-+
-+    def test_vector_distance_errors_match_postgres(self) -> None:
-+        a = Vector([1, 2])
-+        b = Vector([1, 2, 3])
-+
-+        with pytest.raises(psycopg.errors.DataException) as pg_error:
-+            conn.execute('SELECT %b::vector <-> %b::vector', (a, b))
-+        with pytest.raises(ValueError) as py_error:
-+            a.l2_distance(b)
-+        assert str(py_error.value) == pg_error.value.diag.message_primary
-+
-+        with pytest.raises(psycopg.errors.DataException) as pg_error:
-+            conn.execute('SELECT %b::vector <#> %b::vector', (a, b))
-+        with pytest.raises(ValueError) as py_error:
-+            a.max_inner_product(b)
-+        assert str(py_error.value) == pg_error.value.diag.message_primary
-+
-+        with pytest.raises(psycopg.errors.DataException) as pg_error:
-+            conn.execute('SELECT %b::vector <=> %b::vector', (a, b))
-+        with pytest.raises(ValueError) as py_error:
-+            a.cosine_distance(b)
-+        assert str(py_error.value) == pg_error.value.diag.message_primary
-+
-+        with pytest.raises(psycopg.errors.DataException) as pg_error:
-+            conn.execute('SELECT %b::vector <+> %b::vector', (a, b))
-+        with pytest.raises(ValueError) as py_error:
-+            a.l1_distance(b)
-+        assert str(py_error.value) == pg_error.value.diag.message_primary
-+
-+        for bad in (Vector([]), Vector([float('nan')]), Vector([float('inf')]), Vector([float('-inf')])):
-+            with pytest.raises(psycopg.errors.DataException) as pg_error:
-+                conn.execute('SELECT %b::vector <-> %b::vector', (bad, Vector([1.0])))
-+            with pytest.raises(ValueError) as py_error:
-+                bad.l2_distance([1.0])
-+            assert str(py_error.value) == pg_error.value.diag.message_primary
-+
-+    def test_bit_distances_match_postgres(self) -> None:
-+        cases: list[tuple[Bit, Bit]] = [
-+            (Bit(''), Bit('')),
-+            (Bit('0'), Bit('0')),
-+            (Bit('1'), Bit('0')),
-+            (Bit('000'), Bit('000')),
-+            (Bit('111'), Bit('111')),
-+            (Bit('101'), Bit('010')),
-+            (Bit('10101'), Bit('11001')),
-+            (Bit('11100'), Bit('10000')),
-+            (Bit('10101010'), Bit('11110000')),
-+            (Bit('10101010101010101'), Bit('11001100110011001')),
-+            (Bit.from_binary(struct.pack('>iB', 3, 0b10111111)), Bit('101')),
-+            (Bit.from_binary(struct.pack('>iB', 3, 0b00011111)), Bit.from_binary(struct.pack('>iB', 3, 0b00010101))),
-+            (Bit.from_binary(struct.pack('>iB', 3, 0b10111111)), Bit.from_binary(struct.pack('>iB', 3, 0b10010101))),
-+            (Bit.from_binary(struct.pack('>iBB', 9, 0b10101010, 0b11111111)), Bit('101010101')),
-+        ]
-+
-+        for a, b in cases:
-+            row = conn.execute(
-+                'SELECT %b::varbit <~> %b::varbit, %b::varbit <%%> %b::varbit',
-+                (a, b, a, b)
-+            ).fetchone()
-+            assert row is not None
-+            pg_hamming, pg_jaccard = row
-+            py_hamming = a.hamming_distance(b)
-+            py_jaccard = a.jaccard_distance(b)
-+            assert py_hamming == pg_hamming
-+            assert math.copysign(1.0, py_hamming) == math.copysign(1.0, pg_hamming)
-+            assert py_jaccard == pg_jaccard
-+            assert math.copysign(1.0, py_jaccard) == math.copysign(1.0, pg_jaccard)
-+
-+    def test_bit_distance_errors_match_postgres(self) -> None:
-+        a = Bit('101')
-+        b = Bit('1010')
-+
-+        with pytest.raises(psycopg.errors.DataException) as pg_error:
-+            conn.execute('SELECT %b::varbit <~> %b::varbit', (a, b))
-+        with pytest.raises(ValueError) as py_error:
-+            a.hamming_distance(b)
-+        assert str(py_error.value) == pg_error.value.diag.message_primary
-+
-+        with pytest.raises(psycopg.errors.DataException) as pg_error:
-+            conn.execute('SELECT %b::varbit <%%> %b::varbit', (a, b))
-+        with pytest.raises(ValueError) as py_error:
-+            a.jaccard_distance(b)
-+        assert str(py_error.value) == pg_error.value.diag.message_primary
+     def _from_text(cls, value: str, /) -> list[float]:
+         if len(value) == 2:
 diff --git a/tests/test_vector.py b/tests/test_vector.py
-index 13a9cc7..ade0889 100644
+index 13a9cc7..0b8784d 100644
 --- a/tests/test_vector.py
 +++ b/tests/test_vector.py
-@@ -1,3 +1,4 @@
-+import math
- from pgvector import Vector
+@@ -1,4 +1,4 @@
+-from pgvector import Vector
++from pgvector import Bit, Vector
  import pytest
  import struct
-@@ -136,3 +137,183 @@ class TestVector:
+ from .conftest import numpy as np
+@@ -136,3 +136,198 @@ class TestVector:
      def test_from_binary_non_zero_unused(self) -> None:
          with pytest.raises(ValueError, match='expected unused to be 0'):
              Vector.from_binary(struct.pack('>hh', 0, 1))
 +
-+    def test_l2_distance(self) -> None:
++    def test_add(self) -> None:
 +        a = Vector([1, 2, 3])
 +        b = Vector([4, 5, 6])
-+        res = a.l2_distance(b)
-+        assert isinstance(res, float)
-+        assert res == math.sqrt(27.0)
-+        same = a.l2_distance(a)
-+        assert same == 0.0
-+        assert math.copysign(1.0, same) == 1.0
++        res = a + b
++        assert res == Vector([5, 7, 9])
++        assert res is not a
++        assert res is not b
++        assert a == Vector([1, 2, 3])
++        assert b == Vector([4, 5, 6])
 +
-+    def test_max_inner_product(self) -> None:
++    def test_add_rounding(self) -> None:
++        assert Vector([16777216.0]) + Vector([1.0]) == Vector([16777216.0])
++        assert Vector([16777216.0]) + Vector([1.5]) == Vector([16777218.0])
++        assert Vector([16777218.0]) + Vector([1.0]) == Vector([16777220.0])
++
++    def test_add_different_dimensions(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1, 2, 3]) + Vector([4, 5])
++        assert str(error.value) == 'different vector dimensions 3 and 2'
++
++    def test_add_overflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([3e38]) + Vector([3e38])
++        assert str(error.value) == 'value out of range'
++
++        with pytest.raises(ValueError) as error:
++            Vector([-3e38]) + Vector([-3e38])
++        assert str(error.value) == 'value out of range'
++
++    def test_add_invalid_type(self) -> None:
++        a = Vector([1, 2, 3])
++        assert a.__add__([1, 2, 3]) is NotImplemented  # type: ignore
++        with pytest.raises(TypeError):
++            a + [1, 2, 3]  # type: ignore
++        with pytest.raises(TypeError):
++            a + 1  # type: ignore
++        with pytest.raises(TypeError):
++            1 + a  # type: ignore
++
++    def test_sub(self) -> None:
 +        a = Vector([1, 2, 3])
 +        b = Vector([4, 5, 6])
-+        res = a.max_inner_product(b)
-+        assert isinstance(res, float)
-+        assert res == -32.0
-+        assert a.max_inner_product([-4, -5, -6]) == 32.0
++        res = a - b
++        assert res == Vector([-3, -3, -3])
++        assert res is not a
++        assert res is not b
++        assert a == Vector([1, 2, 3])
++        assert b == Vector([4, 5, 6])
 +
-+    def test_cosine_distance(self) -> None:
++    def test_sub_different_dimensions(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1, 2]) - Vector([4, 5, 6])
++        assert str(error.value) == 'different vector dimensions 2 and 3'
++
++    def test_sub_overflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([3e38]) - Vector([-3e38])
++        assert str(error.value) == 'value out of range'
++
++        with pytest.raises(ValueError) as error:
++            Vector([-3e38]) - Vector([3e38])
++        assert str(error.value) == 'value out of range'
++
++    def test_sub_invalid_type(self) -> None:
++        a = Vector([1, 2, 3])
++        assert a.__sub__([1, 2, 3]) is NotImplemented  # type: ignore
++        with pytest.raises(TypeError):
++            a - [1, 2, 3]  # type: ignore
++        with pytest.raises(TypeError):
++            a - 1  # type: ignore
++        with pytest.raises(TypeError):
++            1 - a  # type: ignore
++
++    def test_mul(self) -> None:
 +        a = Vector([1, 2, 3])
 +        b = Vector([4, 5, 6])
-+        res = a.cosine_distance(b)
-+        assert isinstance(res, float)
-+        assert res == pytest.approx(1.0 - 32.0 / math.sqrt(14.0 * 77.0))
-+        same = a.cosine_distance(a)
-+        assert same == 0.0
-+        assert math.copysign(1.0, same) == 1.0
-+        assert a.cosine_distance([-1, -2, -3]) == 2.0
-+        assert Vector([1, 0]).cosine_distance([0, 1]) == 1.0
++        res = a * b
++        assert res == Vector([4, 10, 18])
++        assert res is not a
++        assert res is not b
++        assert a == Vector([1, 2, 3])
++        assert b == Vector([4, 5, 6])
 +
-+    def test_cosine_distance_clamping(self) -> None:
-+        a = Vector([0.4, 0.7, 1.0, 1.3, 1.6, 1.9, 2.2])
-+        b = Vector([x * 3.0 for x in a.to_list()])
-+        c = Vector([-x * 3.0 for x in a.to_list()])
-+        pos = a.cosine_distance(b)
-+        neg = a.cosine_distance(c)
-+        assert pos == 0.0
-+        assert math.copysign(1.0, pos) == 1.0
-+        assert neg == 2.0
++    def test_mul_different_dimensions(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1, 2, 3]) * Vector([4])
++        assert str(error.value) == 'different vector dimensions 3 and 1'
 +
-+    def test_cosine_distance_zero_vector(self) -> None:
-+        assert math.isnan(Vector([0, 0, 0]).cosine_distance([1, 2, 3]))
-+        assert math.isnan(Vector([1, 2, 3]).cosine_distance([0, 0, 0]))
-+        assert math.isnan(Vector([0, 0, 0]).cosine_distance([0, 0, 0]))
++    def test_mul_overflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1e20]) * Vector([1e20])
++        assert str(error.value) == 'value out of range'
 +
-+    def test_l1_distance(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([-1e20]) * Vector([1e20])
++        assert str(error.value) == 'value out of range'
++
++    def test_mul_underflow(self) -> None:
++        with pytest.raises(ValueError) as error:
++            Vector([1e-30]) * Vector([1e-30])
++        assert str(error.value) == 'value out of range: underflow'
++
++        with pytest.raises(ValueError) as error:
++            Vector([-1e-30]) * Vector([1e-30])
++        assert str(error.value) == 'value out of range: underflow'
++
++        with pytest.raises(ValueError) as error:
++            Vector([1e-23]) * Vector([1e-23])
++        assert str(error.value) == 'value out of range: underflow'
++
++        assert Vector([1e-20]) * Vector([1e-20]) == Vector([1e-40])
++        assert Vector([0.0]) * Vector([1e-30]) == Vector([0.0])
++        assert Vector([1e-30]) * Vector([0.0]) == Vector([0.0])
++        assert Vector([-0.0]) * Vector([1e-30]) == Vector([0.0])
++
++    def test_mul_invalid_type(self) -> None:
 +        a = Vector([1, 2, 3])
-+        b = Vector([4, 5, 6])
-+        res = a.l1_distance(b)
-+        assert isinstance(res, float)
-+        assert res == 9.0
-+        same = a.l1_distance(a)
-+        assert same == 0.0
-+        assert math.copysign(1.0, same) == 1.0
-+        assert Vector([1.5, -2.5]).l1_distance([-0.5, 1.5]) == 6.0
++        assert a.__mul__([1, 2, 3]) is NotImplemented  # type: ignore
++        with pytest.raises(TypeError):
++            a * [1, 2, 3]  # type: ignore
++        with pytest.raises(TypeError):
++            a * 2  # type: ignore
++        with pytest.raises(TypeError):
++            2 * a  # type: ignore
 +
-+    def test_distance_input_forms(self) -> None:
++    def test_concat(self) -> None:
 +        a = Vector([1, 2, 3])
-+        assert a.l2_distance([4, 5, 6]) == math.sqrt(27.0)
-+        assert a.max_inner_product([4, 5, 6]) == -32.0
-+        assert a.cosine_distance([1, 2, 3]) == 0.0
-+        assert a.l1_distance([4, 5, 6]) == 9.0
-+        assert Vector([0.1, 0.2, 0.3]).l2_distance([0.1, 0.2, 0.3]) == 0.0
++        b = Vector([4, 5])
++        res = a.concat(b)
++        assert res == Vector([1, 2, 3, 4, 5])
++        assert res is not a
++        assert res is not b
++        assert a == Vector([1, 2, 3])
++        assert b == Vector([4, 5])
 +
-+        if np is None:
-+            pytest.skip('NumPy required')
++    def test_concat_max_dimensions(self) -> None:
++        a = Vector([0.0] * 8000)
++        b = Vector([0.0] * 8000)
++        assert a.concat(b).dimensions() == 16000
 +
-+        arr = np.array([4, 5, 6], dtype=np.float32)
-+        assert a.l2_distance(arr) == math.sqrt(27.0)
-+        assert a.max_inner_product(arr) == -32.0
-+        assert a.cosine_distance(np.array([1.0, 2.0, 3.0], dtype=np.float64)) == 0.0
-+        assert a.l1_distance(np.flip(np.array([6, 5, 4], dtype=np.float32))) == 9.0
-+        assert a.l1_distance(arr.astype('>f4')) == 9.0
++        c = Vector([0.0] * 8001)
++        with pytest.raises(ValueError) as error:
++            c.concat(b)
++        assert str(error.value) == 'vector cannot have more than 16000 dimensions'
 +
-+    def test_distance_invalid_input(self) -> None:
-+        a = Vector([1, 2, 3])
-+        with pytest.raises(ValueError, match='expected list or ndarray'):
-+            a.l2_distance(1)  # type: ignore
-+        with pytest.raises(ValueError, match='expected list\\[float\\]'):
-+            a.max_inner_product([1, 'two', 3])  # type: ignore
-+        if np is not None:
-+            with pytest.raises(ValueError, match='expected ndim to be 1'):
-+                a.l1_distance(np.array([[1.0, 2.0, 3.0]]))
++    def test_l2_normalize(self) -> None:
++        a = Vector([3, 4])
++        res = a.l2_normalize()
++        assert res == Vector([0.6, 0.8])
++        assert res is not a
++        assert a == Vector([3, 4])
 +
-+    def test_distance_different_dimensions(self) -> None:
-+        a = Vector([1, 2])
-+        b = Vector([1, 2, 3])
-+        for method in (a.l2_distance, a.max_inner_product, a.cosine_distance, a.l1_distance):
++    def test_l2_normalize_zero(self) -> None:
++        a = Vector([0.0, 0.0, 0.0])
++        res = a.l2_normalize()
++        assert res == Vector([0.0, 0.0, 0.0])
++        assert res is not a
++
++        b = Vector([-0.0, -0.0])
++        res_b = b.l2_normalize()
++        assert res_b.to_binary() == Vector([0.0, 0.0]).to_binary()
++
++    def test_l2_normalize_extreme_values(self) -> None:
++        assert Vector([3e38, 3e38]).l2_normalize() == Vector([0.7071067690849304, 0.7071067690849304])
++        assert Vector([1e-45]).l2_normalize() == Vector([1.0])
++        assert Vector([3e38, 1e-45]).l2_normalize() == Vector([1.0, 0.0])
++
++    def test_binary_quantize(self) -> None:
++        a = Vector([1, -2, 0])
++        res = a.binary_quantize()
++        assert isinstance(res, Bit)
++        assert res == Bit('100')
++        assert a == Vector([1, -2, 0])
++
++        assert Vector([1, -2, 0, 1]).binary_quantize() == Bit('1001')
++        assert Vector([0.0, -0.0, 1e-45, -1e-45]).binary_quantize() == Bit('0010')
++        assert Vector([1.0, -1.0, 1.0, 1.0, 0.0, -0.0, 2.0, -3.0, 4.0]).binary_quantize() == Bit('101100101')
++
++    def test_subvector(self) -> None:
++        a = Vector([1, 2, 3, 4, 5])
++        assert a.subvector(2, 3) == Vector([2, 3, 4])
++        assert a.subvector(4, 10) == Vector([4, 5])
++        assert a.subvector(0, 2) == Vector([1])
++        assert a.subvector(-5, 7) == Vector([1])
++        assert a.subvector(1, 5) == Vector([1, 2, 3, 4, 5])
++        assert a.subvector(1, 5) is not a
++        assert a == Vector([1, 2, 3, 4, 5])
++
++    def test_subvector_errors(self) -> None:
++        a = Vector([1, 2, 3, 4, 5])
++        for start, count in [(-5, 2), (-5, 6), (0, 1), (6, 1), (1, 0), (1, -1)]:
 +            with pytest.raises(ValueError) as error:
-+                method(b)
-+            assert str(error.value) == 'different vector dimensions 2 and 3'
-+
-+    def test_distance_empty(self) -> None:
-+        empty = Vector([])
-+        one = Vector([1.0])
-+        for a, b in ((empty, empty), (empty, one), (one, empty)):
-+            for method in (a.l2_distance, a.max_inner_product, a.cosine_distance, a.l1_distance):
-+                with pytest.raises(ValueError) as error:
-+                    method(b)
-+                assert str(error.value) == 'vector must have at least 1 dimension'
-+
-+    def test_distance_nan(self) -> None:
-+        v_nan = Vector([float('nan')])
-+        v_one = Vector([1.0])
-+        pairs: list[tuple[Vector, list[float] | Vector]] = [
-+            (v_nan, v_one),
-+            (v_one, v_nan),
-+            (v_one, [float('nan')]),
-+        ]
-+        for a, b in pairs:
-+            for method in (a.l2_distance, a.max_inner_product, a.cosine_distance, a.l1_distance):
-+                with pytest.raises(ValueError) as error:
-+                    method(b)
-+                assert str(error.value) == 'NaN not allowed in vector'
-+
-+    def test_distance_infinity(self) -> None:
-+        v_inf = Vector([float('inf')])
-+        v_ninf = Vector([float('-inf')])
-+        v_one = Vector([1.0])
-+        pairs: list[tuple[Vector, list[float] | Vector]] = [
-+            (v_inf, v_one),
-+            (v_one, v_inf),
-+            (v_one, v_ninf),
-+            (v_one, [1e40]),
-+        ]
-+        for a, b in pairs:
-+            for method in (a.l2_distance, a.max_inner_product, a.cosine_distance, a.l1_distance):
-+                with pytest.raises(ValueError) as error:
-+                    method(b)
-+                assert str(error.value) == 'infinite value not allowed in vector'
-+
-+    def test_distance_float32_overflow(self) -> None:
-+        assert Vector([3e38]).l2_distance([-3e38]) == math.inf
-+        assert Vector([1e20]).l2_distance([0.0]) == math.inf
-+        assert Vector([1e20]).max_inner_product([1e20]) == -math.inf
-+        assert Vector([1e20]).max_inner_product([-1e20]) == math.inf
-+        assert math.isnan(Vector([1e20]).cosine_distance([1e20]))
-+        assert Vector([1e20]).cosine_distance([1.0]) == 1.0
-+        assert Vector([3e38, 3e38]).l1_distance([0.0, 0.0]) == math.inf
-+        assert Vector([3e38]).l1_distance([-3e38]) == math.inf
-+
-+    def test_distance_float32_underflow(self) -> None:
-+        l2 = Vector([1e-25]).l2_distance([0.0])
-+        assert l2 == 0.0
-+        assert math.copysign(1.0, l2) == 1.0
-+        ip = Vector([1e-25]).max_inner_product([1e-25])
-+        assert ip == 0.0
-+        assert math.copysign(1.0, ip) == -1.0
-+        assert math.isnan(Vector([1e-25]).cosine_distance([1e-25]))
-+        assert Vector([1e-25]).cosine_distance([1.0]) == 0.0
-+        assert Vector([-1e-25]).cosine_distance([1.0]) == 2.0
-+        assert math.isnan(Vector([1e-25]).cosine_distance([1e20]))
-+        assert Vector([1e-20]).l2_distance([0.0]) == pytest.approx(9.999973050521006e-21, rel=1e-12)
-+
-+    def test_distance_float32_accumulation(self) -> None:
-+        assert Vector([16777216.0, 1.0]).l1_distance([0.0, 0.0]) == 16777216.0
-+        assert Vector([4096.0, 1.0]).l2_distance([0.0, 0.0]) == 4096.0
-+        assert Vector([16777216.0, 1.0]).max_inner_product([1.0, 1.0]) == -16777216.0
-+
-+    def test_distance_signed_zero(self) -> None:
-+        for a, b in (
-+            ([0.0, 0.0], [0.0, 0.0]),
-+            ([-0.0], [0.0]),
-+            ([0.0], [-0.0]),
-+            ([-0.0], [-0.0]),
-+            ([1.0, 0.0], [0.0, 1.0]),
-+            ([1.0, -1.0], [1.0, 1.0]),
-+        ):
-+            ip = Vector(a).max_inner_product(b)
-+            assert ip == 0.0
-+            assert math.copysign(1.0, ip) == -1.0
-+
-+        for res in (
-+            Vector([-0.0]).l2_distance([0.0]),
-+            Vector([-0.0]).l1_distance([0.0]),
-+            Vector([1.0, 2.0]).cosine_distance([1.0, 2.0]),
-+        ):
-+            assert res == 0.0
-+            assert math.copysign(1.0, res) == 1.0
++                a.subvector(start, count)
++            assert str(error.value) == 'vector must have at least 1 dimension'
