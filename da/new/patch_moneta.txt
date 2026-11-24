@@ -1,368 +1,215 @@
-diff --git a/pgvector/bit.py b/pgvector/bit.py
-index a9370e4..90d5846 100644
---- a/pgvector/bit.py
-+++ b/pgvector/bit.py
-@@ -85,6 +85,9 @@ class Bit:
+diff --git a/pgvector/_utils.py b/pgvector/_utils.py
+index 4cafc32..036dde1 100644
+--- a/pgvector/_utils.py
++++ b/pgvector/_utils.py
+@@ -1,3 +1,5 @@
++import math
++import struct
+ import sys
+ from typing import TYPE_CHECKING, TypeAlias
  
-     @classmethod
-     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> Bit:
-+        if len(value) < 4:
-+            raise ValueError('invalid length')
+@@ -10,6 +12,11 @@ else:
+     # TODO use Never when Python 3.10 no longer supported
+     ndarray = None
+ 
++_f32_struct = struct.Struct('f')
++_f16_struct = struct.Struct('e')
++_f32_fmts = tuple(f'%.{p}e' for p in range(9))
++_f16_fmts = tuple(f'%.{p}e' for p in range(5))
 +
-         length, = unpack_from('>i', value)
-         data = memoryview(value)[4:].tobytes()
  
+ def is_ndarray(value: object, /) -> bool:
+     if (numpy := sys.modules.get('numpy')):
+@@ -21,3 +28,48 @@ def is_sparse_array(value: object, /) -> bool:
+     if (sparse := sys.modules.get('scipy.sparse')):
+         return isinstance(value, (sparse.sparray, sparse.spmatrix))
+     return False
++
++
++def _format_decimal(s: str, /) -> str:
++    neg = s[0] == '-'
++    if neg:
++        s = s[1:]
++    mant, exp_s = s.split('e')
++    x = int(exp_s)
++    digits = mant.replace('.', '').rstrip('0')
++    if -4 <= x < 16:
++        k = len(digits)
++        if x < 0:
++            res = f'0.{"0" * (-x - 1)}{digits}'
++        elif x + 1 >= k:
++            res = f'{digits}{"0" * (x + 1 - k)}'
++        else:
++            res = f'{digits[:x + 1]}.{digits[x + 1:]}'
++    elif len(digits) > 1:
++        res = f'{digits[0]}.{digits[1:]}e{x:+03d}'
++    else:
++        res = f'{digits}e{x:+03d}'
++    return f'-{res}' if neg else res
++
++
++def _format_float(v: float, fmts: tuple[str, ...], packer: struct.Struct, /) -> str:
++    vb = packer.pack(v)
++    vf: float = packer.unpack(vb)[0]
++    if vf == 0.0:
++        return '-0' if math.copysign(1.0, vf) < 0 else '0'
++    for fmt in fmts:
++        s = fmt % vf
++        try:
++            if packer.pack(float(s)) == vb:
++                return _format_decimal(s)
++        except OverflowError:
++            pass
++    raise ValueError('expected finite float')
++
++
++def format_float32(v: float, /) -> str:
++    return _format_float(v, _f32_fmts, _f32_struct)
++
++
++def format_float16(v: float, /) -> str:
++    return _format_float(v, _f16_fmts, _f16_struct)
 diff --git a/pgvector/halfvec.py b/pgvector/halfvec.py
-index 2b3b325..efc90e1 100644
+index 2b3b325..b017443 100644
 --- a/pgvector/halfvec.py
 +++ b/pgvector/halfvec.py
-@@ -68,6 +68,9 @@ class HalfVector:
+@@ -3,7 +3,7 @@ from array import array
+ import struct
+ import sys
+ from typing import TYPE_CHECKING
+-from ._utils import is_ndarray, ndarray
++from ._utils import format_float16, is_ndarray, ndarray
  
-     @classmethod
-     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> HalfVector:
-+        if len(value) < 4:
-+            raise ValueError('invalid length')
-+
-         dim, unused = struct.unpack_from('>hh', value)
-         data = memoryview(value)[4:]
+ if TYPE_CHECKING:
+     import numpy as np
+@@ -51,7 +51,7 @@ class HalfVector:
+         return np.frombuffer(self._value, dtype=np.float16)
  
-@@ -88,6 +91,9 @@ class HalfVector:
+     def to_text(self) -> str:
+-        return f'[{",".join([str(v) for v in self.to_list()])}]'
++        return f'[{",".join([format_float16(v) for v in self.to_list()])}]'
  
-     @classmethod
-     def _from_text(cls, value: str, /) -> list[float]:
-+        if not value.startswith('[') or not value.endswith(']'):
-+            raise ValueError('malformed halfvec literal')
-+
-         if len(value) == 2:
-             return []
-         return [float(v) for v in value[1:-1].split(',')]
-diff --git a/pgvector/sparsevec.py b/pgvector/sparsevec.py
-index 76e1356..9f68a29 100644
---- a/pgvector/sparsevec.py
-+++ b/pgvector/sparsevec.py
-@@ -101,8 +101,7 @@ class SparseVector:
-         self._dim = int(dim)
-         self._indices = [int(v[0]) for v in elements]
-         self._values = [float(v[1]) for v in elements]
--        # TODO uncomment in 0.6.0
--        # self._validate()
-+        self._validate()
+     def to_binary(self) -> bytes:
+         if sys.byteorder == 'big':
+@@ -99,7 +99,7 @@ class HalfVector:
  
-     def _from_sparse(self, arr: sparray | spmatrix, /) -> None:
-         value: coo_array | coo_matrix = arr.tocoo(copy=False)  # type: ignore
-@@ -172,6 +171,9 @@ class SparseVector:
+         # fewer allocations for lists
+         if isinstance(value, list):
+-            return f'[{",".join([str(float(v)) for v in value])}]'  # type: ignore
++            return f'[{",".join([format_float16(float(v)) for v in value])}]'  # type: ignore
  
-     @classmethod
-     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> SparseVector:
-+        if len(value) < 12:
-+            raise ValueError('invalid length')
-+
-         dim, nnz, unused = unpack_from('>iii', value)
- 
-         if len(value) != 12 + 8 * nnz:
-@@ -190,9 +192,8 @@ class SparseVector:
-         vec._dim = dim
-         vec._indices = indices
-         vec._values = values
--        # TODO uncomment in 0.6.0
--        # vec._validate()
--        # vec._validate_sorted()
-+        vec._validate()
-+        vec._validate_sorted()
-         return vec
- 
-     @classmethod
+         if not isinstance(value, HalfVector):
+             value = cls(value)
 diff --git a/pgvector/vector.py b/pgvector/vector.py
-index d86cba0..de5d128 100644
+index d86cba0..a929d00 100644
 --- a/pgvector/vector.py
 +++ b/pgvector/vector.py
-@@ -66,6 +66,9 @@ class Vector:
+@@ -3,7 +3,7 @@ from array import array
+ import struct
+ import sys
+ from typing import TYPE_CHECKING
+-from ._utils import is_ndarray, ndarray
++from ._utils import format_float32, is_ndarray, ndarray
  
-     @classmethod
-     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> Vector:
-+        if len(value) < 4:
-+            raise ValueError('invalid length')
-+
-         dim, unused = struct.unpack_from('>hh', value)
-         data = memoryview(value)[4:]
+ if TYPE_CHECKING:
+     import numpy as np
+@@ -49,7 +49,7 @@ class Vector:
+         return np.frombuffer(self._value, dtype=np.float32)
  
-@@ -86,6 +89,9 @@ class Vector:
+     def to_text(self) -> str:
+-        return f'[{",".join([str(v) for v in self._value])}]'
++        return f'[{",".join([format_float32(v) for v in self._value])}]'
  
-     @classmethod
-     def _from_text(cls, value: str, /) -> list[float]:
-+        if not value.startswith('[') or not value.endswith(']'):
-+            raise ValueError('malformed vector literal')
-+
-         if len(value) == 2:
-             return []
-         return [float(v) for v in value[1:-1].split(',')]
-diff --git a/tests/test_bit.py b/tests/test_bit.py
-index 9179cd3..1235433 100644
---- a/tests/test_bit.py
-+++ b/tests/test_bit.py
-@@ -127,10 +127,14 @@ class TestBit:
-         assert Bit.from_binary(struct.pack('>iB', 3, 5 << 5)) == Bit('101')
+     def to_binary(self) -> bytes:
+         if sys.byteorder == 'big':
+@@ -97,7 +97,7 @@ class Vector:
  
-     def test_from_binary_zero_length(self) -> None:
--        # TODO change to ValueError('invalid length') in 0.6.0
--        with pytest.raises(struct.error, match='unpack_from requires a buffer of at least 4 bytes'):
-+        with pytest.raises(ValueError, match='invalid length'):
-             Bit.from_binary(b'')
+         # fewer allocations for lists
+         if isinstance(value, list):
+-            return f'[{",".join([str(float(v)) for v in value])}]'  # type: ignore
++            return f'[{",".join([format_float32(float(v)) for v in value])}]'  # type: ignore
  
-+    def test_from_binary_truncated_header(self) -> None:
-+        for length in range(1, 4):
-+            with pytest.raises(ValueError, match='invalid length'):
-+                Bit.from_binary(b'\x00' * length)
-+
-     def test_from_binary_missing_data(self) -> None:
-         with pytest.raises(ValueError, match='invalid length'):
-             Bit.from_binary(struct.pack('>iB', 9, 0))
+         if not isinstance(value, Vector):
+             value = cls(value)
 diff --git a/tests/test_half_vector.py b/tests/test_half_vector.py
-index a907c94..dd5414e 100644
+index a907c94..1f5bc3b 100644
 --- a/tests/test_half_vector.py
 +++ b/tests/test_half_vector.py
-@@ -95,32 +95,51 @@ class TestHalfVector:
-         assert HalfVector.from_text('[1.5,2,3]') == HalfVector([1.5, 2, 3])
+@@ -86,7 +86,27 @@ class TestHalfVector:
+         assert arr.dtype == np.float16
  
-     def test_from_text_zero_length(self) -> None:
--        with pytest.raises(ValueError, match='could not convert string to float'):
-+        with pytest.raises(ValueError, match='malformed halfvec literal'):
-             HalfVector.from_text('')
- 
-     def test_from_text_zero_dimensions(self) -> None:
-         assert HalfVector.from_text('[]') == HalfVector([])
- 
-     def test_from_text_open_bracket(self) -> None:
--        # TODO raise ValueError in 0.6.0
--        assert HalfVector.from_text('{1]')
-+        with pytest.raises(ValueError, match='malformed halfvec literal'):
-+            HalfVector.from_text('{1]')
- 
-     def test_from_text_close_bracket(self) -> None:
--        # TODO raise ValueError in 0.6.0
--        assert HalfVector.from_text('[1}')
-+        with pytest.raises(ValueError, match='malformed halfvec literal'):
-+            HalfVector.from_text('[1}')
+     def test_to_text(self) -> None:
+-        assert HalfVector([1.5, 2, 3]).to_text() == '[1.5,2.0,3.0]'
++        assert HalfVector([1.5, 2, 3]).to_text() == '[1.5,2,3]'
 +
-+    def test_from_text_malformed(self) -> None:
-+        for value in ['[1', '1]', '1', '[] ', ' []', '[', ']']:
-+            with pytest.raises(ValueError, match='malformed halfvec literal'):
-+                HalfVector.from_text(value)
-+            with pytest.raises(ValueError, match='malformed halfvec literal'):
-+                HalfVector._from_db(value)
++    def test_to_text_empty(self) -> None:
++        assert HalfVector([]).to_text() == '[]'
 +
-+    def test_from_db(self) -> None:
-+        assert HalfVector._from_db('[1.5,2,3]') == [1.5, 2, 3]
-+        assert HalfVector._from_db('[]') == []
-+        assert HalfVector._from_db(None) is None
-+        assert HalfVector._from_db(HalfVector([1, 2])) == [1, 2]
- 
-     def test_from_text_non_number(self) -> None:
-         with pytest.raises(ValueError, match='could not convert string to float'):
-             assert HalfVector.from_text('[a]')
-+        with pytest.raises(ValueError, match='could not convert string to float'):
-+            HalfVector.from_text('[1,x]')
- 
-     def test_from_binary(self) -> None:
-         assert HalfVector.from_binary(struct.pack('>hh3e', 3, 0, 1.5, 2, 3)) == HalfVector([1.5, 2, 3])
- 
-     def test_from_binary_zero_length(self) -> None:
--        # TODO change to ValueError('invalid length') in 0.6.0
--        with pytest.raises(struct.error, match='unpack_from requires a buffer of at least 4 bytes'):
-+        with pytest.raises(ValueError, match='invalid length'):
-             HalfVector.from_binary(b'')
- 
-+    def test_from_binary_truncated_header(self) -> None:
-+        for length in range(1, 4):
-+            with pytest.raises(ValueError, match='invalid length'):
-+                HalfVector.from_binary(b'\x00' * length)
++    def test_to_text_shortest(self) -> None:
++        assert HalfVector([0.1, 1.5]).to_text() == '[0.1,1.5]'
++        assert HalfVector([-0.0, 0.0]).to_text() == '[-0,0]'
++        assert HalfVector([0.1, 1 / 3, 2049]).to_text() == '[0.1,0.3333,2048]'
++        assert HalfVector([0.0001, 1e-5, -2.5e-7]).to_text() == '[0.0001,1e-05,-2.4e-07]'
++        assert HalfVector([65504, -65504, 2.0 ** -24]).to_text() == '[65500,-65500,6e-08]'
 +
-     def test_from_binary_missing_data(self) -> None:
-         with pytest.raises(ValueError, match='invalid length'):
-             HalfVector.from_binary(struct.pack('>hhe', 2, 0, 1))
-diff --git a/tests/test_sparse_vector.py b/tests/test_sparse_vector.py
-index e3bb8cc..4c36dcc 100644
---- a/tests/test_sparse_vector.py
-+++ b/tests/test_sparse_vector.py
-@@ -45,20 +45,31 @@ class TestSparseVector:
-     def test_init_dict_empty(self) -> None:
-         assert SparseVector({}, 0).to_list() == []
++    def test_to_db(self) -> None:
++        assert HalfVector._to_db(None) is None
++        lst = [0.1, 1.5, 2, -0.0, 0.0, 2049, 1 / 3, 1e-5, 65504]
++        assert HalfVector._to_db(lst) == HalfVector(lst).to_text()
++        assert HalfVector._to_db([0.1, 2049]) == '[0.1,2048]'
++        assert HalfVector._to_db(HalfVector([0.1, 2049])) == '[0.1,2048]'
++        if np is not None:
++            arr = np.array([0.1, 2049], dtype=np.float16)
++            assert HalfVector._to_db(arr) == '[0.1,2048]'
  
--    # TODO uncomment in 0.6.0
--    # def test_dict_negative_index(self) -> None:
--    #     with pytest.raises(ValueError, match='sparsevec index out of bounds'):
--    #         SparseVector({-1: 1}, 3)
-+    def test_dict_negative_index(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector({-1: 1}, 3)
+     def test_to_binary(self) -> None:
+         assert HalfVector([1.5, 2, 3]).to_binary() == struct.pack('>hh3e', 3, 0, 1.5, 2, 3)
+diff --git a/tests/test_sqlalchemy.py b/tests/test_sqlalchemy.py
+index dc58aeb..7f1d2da 100644
+--- a/tests/test_sqlalchemy.py
++++ b/tests/test_sqlalchemy.py
+@@ -516,7 +516,7 @@ class TestSqlalchemy:
  
--    # TODO uncomment in 0.6.0
--    # def test_dict_higher_index(self) -> None:
--    #     with pytest.raises(ValueError, match='sparsevec index out of bounds'):
--    #         SparseVector({3: 1}, 3)
-+    def test_dict_higher_index(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector({3: 1}, 3)
+     def test_literal_binds(self, engine: Engine) -> None:
+         sql = select(Item).order_by(Item.embedding.l2_distance([1, 2, 3])).compile(engine, compile_kwargs={'literal_binds': True})
+-        assert "embedding <-> '[1.0,2.0,3.0]'" in str(sql)
++        assert "embedding <-> '[1,2,3]'" in str(sql)
  
--    # TODO uncomment in 0.6.0
--    # def test_dict_negative_dimensions(self) -> None:
--    #     with pytest.raises(ValueError, match='sparsevec cannot have negative dimensions'):
--    #         SparseVector({}, -1)
-+    def test_dict_negative_dimensions(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec cannot have negative dimensions'):
-+            SparseVector({}, -1)
-+
-+    def test_dict_zero_value_dropped_before_validation(self) -> None:
-+        vec = SparseVector({5: 0}, 3)
-+        assert vec.dimensions() == 3
-+        assert vec.indices() == []
-+        assert vec.values() == []
-+
-+    def test_dict_negative_dimensions_before_index_out_of_bounds(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec cannot have negative dimensions'):
-+            SparseVector({-1: 1}, -1)
-+
-+    def test_dict_single_element(self) -> None:
-+        vec = SparseVector({0: 1}, 1)
-+        assert vec.to_list() == [1.0]
- 
-     def test_init_dict_no_dimensions(self) -> None:
-         with pytest.raises(ValueError) as error:
-@@ -190,25 +201,63 @@ class TestSparseVector:
-         with pytest.raises(ValueError, match='could not convert string to float'):
-             assert SparseVector.from_text('{1:a}/1')
- 
--    # TODO uncomment in 0.6.0
--    # def test_from_text_unsorted(self) -> None:
--    #     with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):
--    #         SparseVector.from_text('{2:1,1:1}/3')
--
--    # TODO uncomment in 0.6.0
--    # def test_from_text_duplicate(self) -> None:
--    #     with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):
--    #         SparseVector.from_text('{2:1,2:1}/3')
-+    def test_from_text_unsorted(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):
-+            SparseVector.from_text('{2:1,1:1}/3')
-+
-+    def test_from_text_duplicate(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):
-+            SparseVector.from_text('{2:1,2:1}/3')
-+
-+    def test_from_text_negative_dimensions(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec cannot have negative dimensions'):
-+            SparseVector.from_text('{0:1}/-1')
-+
-+    def test_from_text_index_out_of_bounds(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector.from_text('{0:1}/3')
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector.from_text('{4:1}/3')
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector.from_text('{4:1,1:1}/3')
-+
-+    def test_from_db(self) -> None:
-+        assert SparseVector._from_db('{1:1}/3') == SparseVector({0: 1}, 3)
-+        assert SparseVector._from_db(None) is None
-+        with pytest.raises(ValueError, match='sparsevec cannot have negative dimensions'):
-+            SparseVector._from_db('{1:1}/-1')
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector._from_db('{0:1}/3')
-+        with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):
-+            SparseVector._from_db('{2:1,1:1}/3')
- 
-     def test_from_binary(self) -> None:
-         data = struct.pack('>iii3i3f', 6, 3, 0, 0, 2, 4, 1.5, 2, 3)
-         assert SparseVector.from_binary(data) == SparseVector([1.5, 0, 2, 0, 3, 0])
- 
-     def test_from_binary_zero_length(self) -> None:
--        # TODO change to ValueError('invalid length') in 0.6.0
--        with pytest.raises(struct.error, match='unpack_from requires a buffer of at least 12 bytes'):
-+        with pytest.raises(ValueError, match='invalid length'):
-             SparseVector.from_binary(b'')
- 
-+    def test_from_binary_truncated_header(self) -> None:
-+        for length in range(1, 12):
-+            with pytest.raises(ValueError, match='invalid length'):
-+                SparseVector.from_binary(b'\x00' * length)
-+
-+    def test_from_binary_validation(self) -> None:
-+        with pytest.raises(ValueError, match='sparsevec cannot have negative dimensions'):
-+            SparseVector.from_binary(struct.pack('>iiiif', -1, 1, 0, -1, 1.0))
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector.from_binary(struct.pack('>iiiif', 3, 1, 0, -1, 1.0))
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector.from_binary(struct.pack('>iiiif', 3, 1, 0, 3, 1.0))
-+        with pytest.raises(ValueError, match='sparsevec index out of bounds'):
-+            SparseVector.from_binary(struct.pack('>iii2i2f', 3, 2, 0, 3, 1, 1.0, 1.0))
-+        with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):
-+            SparseVector.from_binary(struct.pack('>iii2i2f', 3, 2, 0, 1, 0, 1.0, 1.0))
-+        with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):
-+            SparseVector.from_binary(struct.pack('>iii2i2f', 3, 2, 0, 1, 1, 1.0, 1.0))
-+
-     def test_from_binary_missing_data(self) -> None:
-         with pytest.raises(ValueError, match='invalid length'):
-             SparseVector.from_binary(struct.pack('>iii2if', 2, 2, 0, 0, 1, 1))
+     def test_insert(self, engine: Engine) -> None:
+         with Session(engine) as session:
 diff --git a/tests/test_vector.py b/tests/test_vector.py
-index 13a9cc7..ac4db2b 100644
+index 13a9cc7..02b4240 100644
 --- a/tests/test_vector.py
 +++ b/tests/test_vector.py
-@@ -95,32 +95,51 @@ class TestVector:
-         assert Vector.from_text('[1.5,2,3]') == Vector([1.5, 2, 3])
+@@ -86,7 +86,30 @@ class TestVector:
+         assert arr.dtype == np.float32
  
-     def test_from_text_zero_length(self) -> None:
--        with pytest.raises(ValueError, match='could not convert string to float'):
-+        with pytest.raises(ValueError, match='malformed vector literal'):
-             Vector.from_text('')
- 
-     def test_from_text_zero_dimensions(self) -> None:
-         assert Vector.from_text('[]') == Vector([])
- 
-     def test_from_text_open_bracket(self) -> None:
--        # TODO raise ValueError in 0.6.0
--        assert Vector.from_text('{1]')
-+        with pytest.raises(ValueError, match='malformed vector literal'):
-+            Vector.from_text('{1]')
- 
-     def test_from_text_close_bracket(self) -> None:
--        # TODO raise ValueError in 0.6.0
--        assert Vector.from_text('[1}')
-+        with pytest.raises(ValueError, match='malformed vector literal'):
-+            Vector.from_text('[1}')
+     def test_to_text(self) -> None:
+-        assert Vector([1.5, 2, 3]).to_text() == '[1.5,2.0,3.0]'
++        assert Vector([1.5, 2, 3]).to_text() == '[1.5,2,3]'
 +
-+    def test_from_text_malformed(self) -> None:
-+        for value in ['[1', '1]', '1', '[] ', ' []', '[', ']']:
-+            with pytest.raises(ValueError, match='malformed vector literal'):
-+                Vector.from_text(value)
-+            with pytest.raises(ValueError, match='malformed vector literal'):
-+                Vector._from_db(value)
++    def test_to_text_empty(self) -> None:
++        assert Vector([]).to_text() == '[]'
 +
-+    def test_from_db(self) -> None:
-+        assert Vector._from_db('[1.5,2,3]') == [1.5, 2, 3]
-+        assert Vector._from_db('[]') == []
-+        assert Vector._from_db(None) is None
-+        assert Vector._from_db(Vector([1, 2])) == [1, 2]
- 
-     def test_from_text_non_number(self) -> None:
-         with pytest.raises(ValueError, match='could not convert string to float'):
-             assert Vector.from_text('[a]')
-+        with pytest.raises(ValueError, match='could not convert string to float'):
-+            Vector.from_text('[1,x]')
- 
-     def test_from_binary(self) -> None:
-         assert Vector.from_binary(struct.pack('>hh3f', 3, 0, 1.5, 2, 3)) == Vector([1.5, 2, 3])
- 
-     def test_from_binary_zero_length(self) -> None:
--        # TODO change to ValueError('invalid length') in 0.6.0
--        with pytest.raises(struct.error, match='unpack_from requires a buffer of at least 4 bytes'):
-+        with pytest.raises(ValueError, match='invalid length'):
-             Vector.from_binary(b'')
- 
-+    def test_from_binary_truncated_header(self) -> None:
-+        for length in range(1, 4):
-+            with pytest.raises(ValueError, match='invalid length'):
-+                Vector.from_binary(b'\x00' * length)
++    def test_to_text_shortest(self) -> None:
++        assert Vector([0.1, 1.5, 2]).to_text() == '[0.1,1.5,2]'
++        assert Vector([-0.0, 0.0]).to_text() == '[-0,0]'
++        assert Vector([100, 16777217]).to_text() == '[100,16777216]'
++        assert Vector([1 / 3, 123456789]).to_text() == '[0.33333334,123456790]'
++        assert Vector([0.0001, 1e-5, -2.5e-7]).to_text() == '[0.0001,1e-05,-2.5e-07]'
++        assert Vector([3e38, 1e16]).to_text() == '[3e+38,1e+16]'
++        assert Vector([1e15, -1e15, -1e16, -0.0001]).to_text() == '[1000000000000000,-1000000000000000,-1e+16,-0.0001]'
++        assert Vector([2.0 ** -149, 3.4028235e38]).to_text() == '[1e-45,3.4028235e+38]'
 +
-     def test_from_binary_missing_data(self) -> None:
-         with pytest.raises(ValueError, match='invalid length'):
-             Vector.from_binary(struct.pack('>hhf', 2, 0, 1))
++    def test_to_db(self) -> None:
++        assert Vector._to_db(None) is None
++        lst = [0.1, 1.5, 2, -0.0, 0.0, 16777217, 1 / 3, 1e-5, 3e38]
++        assert Vector._to_db(lst) == Vector(lst).to_text()
++        assert Vector._to_db([0.1, 2]) == '[0.1,2]'
++        assert Vector._to_db(Vector([0.1, 2])) == '[0.1,2]'
++        if np is not None:
++            arr = np.array([0.1, 2], dtype=np.float32)
++            assert Vector._to_db(arr) == '[0.1,2]'
+ 
+     def test_to_binary(self) -> None:
+         assert Vector([1.5, 2, 3]).to_binary() == struct.pack('>hh3f', 3, 0, 1.5, 2, 3)
