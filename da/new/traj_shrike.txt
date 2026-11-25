@@ -1,1 +1,634 @@
-
+{
+  "schema_version": "ATIF-v1.7",
+  "session_id": "ses_dec3adcb5ffezTCFloN44sCSl6",
+  "agent": {
+    "name": "opencode",
+    "version": "1.18.18",
+    "model_name": "anthropic/shrike"
+  },
+  "steps": [
+    {
+      "step_id": 1,
+      "source": "user",
+      "message": "In pgvector-python, a `Vector`, `HalfVector`, `SparseVector` or `Bit` should come back exactly the same from its own text format (`to_text` -> `from_text`) and its binary format (`to_binary` -> `from_binary`), as it would after a trip through Postgres. Today that isn't always true.\n\n\n\nFind every case where a value the library accepts (from a constructor, `from_text` or `from_binary`) doesn't round-trip exactly, and fix it. For each case, either make the round trip work or reject the value up front with a `ValueError`, as the library does for other invalid input. Values that work today should keep working.\n\n\n\nDon't change existing tests; you may add tests. NumPy and SciPy must stay optional."
+    },
+    {
+      "step_id": 2,
+      "timestamp": "2026-11-25T17:33:41.829000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01MdGQCg3Rf7jJueD2Y4EpGL",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && git log --oneline -3 && ls && ls pgvector tests && cat pgvector/vector.py pgvector/halfvec.py pgvector/sparsevec.py pgvector/bit.py"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01MdGQCg3Rf7jJueD2Y4EpGL",
+            "content": "dc90563 initialize repo\nCHANGELOG.md\nLICENSE.txt\nMakefile\nREADME.md\nexamples\npgvector\npyproject.toml\ntests\npgvector:\n__init__.py\n_utils.py\nasyncpg\nbit.py\ndjango\nhalfvec.py\npeewee\npg8000\npsycopg\npsycopg2\npy.typed\nsparsevec.py\nsqlalchemy\nvector.py\n\ntests:\n__init__.py\nconftest.py\ntest_asyncpg.py\ntest_bit.py\ntest_django.py\ntest_half_vector.py\ntest_peewee.py\ntest_pg8000.py\ntest_psycopg.py\ntest_psycopg2.py\ntest_sparse_vector.py\ntest_sqlalchemy.py\ntest_sqlmodel.py\ntest_vector.py\nfrom __future__ import annotations\nfrom array import array\nimport struct\nimport sys\nfrom typing import TYPE_CHECKING\nfrom ._utils import is_ndarray, ndarray\n\nif TYPE_CHECKING:\n    import numpy as np\n\n\nclass Vector:\n    _value: array[float]\n\n    def __init__(self, value: list[float] | ndarray, /) -> None:\n        if isinstance(value, list):\n            try:\n                self._value = array('f', value)\n            except TypeError:\n                raise ValueError('expected list[float]')\n        elif is_ndarray(value):\n            import numpy as np\n\n            if value.ndim != 1:\n                raise ValueError('expected ndim to be 1')\n\n            arr = array('f')\n            arr.frombytes(value.astype(np.float32, order='C', copy=False).data.cast('B'))\n            self._value = arr\n        else:\n            raise ValueError('expected list or ndarray')\n\n    def __repr__(self) -> str:\n        return f'Vector({self.to_list()})'\n\n    def __eq__(self, other: object, /) -> bool:\n        if not isinstance(other, self.__class__):\n            return NotImplemented\n        return self._value == other._value\n\n    def dimensions(self) -> int:\n        return len(self._value)\n\n    def to_list(self) -> list[float]:\n        return self._value.tolist()\n\n    def to_numpy(self) -> np.ndarray[tuple[int, ...], np.dtype[np.float32]]:\n        import numpy as np\n        return np.frombuffer(self._value, dtype=np.float32)\n\n    def to_text(self) -> str:\n        return f'[{\",\".join([str(v) for v in self._value])}]'\n\n    def to_binary(self) -> bytes:\n        if sys.byteorder == 'big':\n            value = self._value\n        else:\n            value = array('f', self._value)\n            value.byteswap()\n        # TODO change to >hh in 0.6.0\n        return struct.pack('>HH', len(value), 0) + memoryview(value)\n\n    @classmethod\n    def from_text(cls, value: str, /) -> Vector:\n        return cls(cls._from_text(value))\n\n    @classmethod\n    def from_binary(cls, value: bytes | bytearray | memoryview, /) -> Vector:\n        dim, unused = struct.unpack_from('>hh', value)\n        data = memoryview(value)[4:]\n\n        if len(data) != 4 * dim:\n            raise ValueError('invalid length')\n\n        if unused != 0:\n            raise ValueError('expected unused to be 0')\n\n        arr = array('f')\n        arr.frombytes(data)\n        if sys.byteorder != 'big':\n            arr.byteswap()\n\n        vec = cls.__new__(cls)\n        vec._value = arr\n        return vec\n\n    @classmethod\n    def _from_text(cls, value: str, /) -> list[float]:\n        if len(value) == 2:\n            return []\n        return [float(v) for v in value[1:-1].split(',')]\n\n    @classmethod\n    def _to_db(cls, value: list[float] | ndarray | Vector | None, /) -> str | None:\n        if value is None:\n            return value\n\n        # fewer allocations for lists\n        if isinstance(value, list):\n            return f'[{\",\".join([str(float(v)) for v in value])}]'  # type: ignore\n\n        if not isinstance(value, Vector):\n            value = cls(value)\n\n        return value.to_text()\n\n    @classmethod\n    def _from_db(cls, value: str | Vector | None, /) -> list[float] | None:\n        if value is None:\n            return value\n\n        if isinstance(value, Vector):\n            return value.to_list()\n\n        return cls._from_text(value)\nfrom __future__ import annotations\nfrom array import array\nimport struct\nimport sys\nfrom typing import TYPE_CHECKING\nfrom ._utils import is_ndarray, ndarray\n\nif TYPE_CHECKING:\n    import numpy as np\n\n\nclass HalfVector:\n    _value: array[int]  # uses uint16 since no float16\n\n    def __init__(self, value: list[float] | ndarray, /) -> None:\n        if isinstance(value, list):\n            dim = len(value)\n            try:\n                self._value = array('H', struct.pack(f'{dim}e', *value))\n            except struct.error:\n                raise ValueError('expected list[float]')\n        elif is_ndarray(value):\n            import numpy as np\n\n            if value.ndim != 1:\n                raise ValueError('expected ndim to be 1')\n\n            arr = array('H')\n            arr.frombytes(value.astype(np.float16, order='C', copy=False).data.cast('B'))\n            self._value = arr\n        else:\n            raise ValueError('expected list or ndarray')\n\n    def __repr__(self) -> str:\n        return f'HalfVector({self.to_list()})'\n\n    def __eq__(self, other: object, /) -> bool:\n        if not isinstance(other, self.__class__):\n            return NotImplemented\n        return self.to_list() == other.to_list()\n\n    def dimensions(self) -> int:\n        return len(self._value)\n\n    def to_list(self) -> list[float]:\n        dim = len(self._value)\n        return list(struct.unpack(f'{dim}e', self._value))\n\n    def to_numpy(self) -> np.ndarray[tuple[int, ...], np.dtype[np.float16]]:\n        import numpy as np\n        return np.frombuffer(self._value, dtype=np.float16)\n\n    def to_text(self) -> str:\n        return f'[{\",\".join([str(v) for v in self.to_list()])}]'\n\n    def to_binary(self) -> bytes:\n        if sys.byteorder == 'big':\n            value = self._value\n        else:\n            value = array('H', self._value)\n            value.byteswap()\n        # TODO change to >hh in 0.6.0\n        return struct.pack('>HH', len(value), 0) + memoryview(value)\n\n    @classmethod\n    def from_text(cls, value: str, /) -> HalfVector:\n        return cls(cls._from_text(value))\n\n    @classmethod\n    def from_binary(cls, value: bytes | bytearray | memoryview, /) -> HalfVector:\n        dim, unused = struct.unpack_from('>hh', value)\n        data = memoryview(value)[4:]\n\n        if len(data) != 2 * dim:\n            raise ValueError('invalid length')\n\n        if unused != 0:\n            raise ValueError('expected unused to be 0')\n\n        arr = array('H')\n        arr.frombytes(data)\n        if sys.byteorder != 'big':\n            arr.byteswap()\n\n        vec = cls.__new__(cls)\n        vec._value = arr\n        return vec\n\n    @classmethod\n    def _from_text(cls, value: str, /) -> list[float]:\n        if len(value) == 2:\n            return []\n        return [float(v) for v in value[1:-1].split(',')]\n\n    @classmethod\n    def _to_db(cls, value: list[float] | ndarray | HalfVector | None, /) -> str | None:\n        if value is None:\n            return value\n\n        # fewer allocations for lists\n        if isinstance(value, list):\n            return f'[{\",\".join([str(float(v)) for v in value])}]'  # type: ignore\n\n        if not isinstance(value, HalfVector):\n            value = cls(value)\n\n        return value.to_text()\n\n    @classmethod\n    def _from_db(cls, value: str | HalfVector | None, /) -> list[float] | None:\n        if value is None:\n            return value\n\n        if isinstance(value, HalfVector):\n            return value.to_list()\n\n        return cls._from_text(value)\nfrom __future__ import annotations\nfrom struct import pack, unpack_from\nfrom typing import TYPE_CHECKING, Final, cast, overload\nfrom ._utils import is_sparse_array, ndarray\n\nif TYPE_CHECKING:\n    import numpy as np\n    from scipy.sparse import sparray, spmatrix, coo_array, coo_matrix\n\n\nclass Sentinel:\n    pass\n\n\nNO_DEFAULT: Final[Sentinel] = Sentinel()\n\n\nclass SparseVector:\n    _dim: int\n    _indices: list[int]\n    _values: list[float]\n\n    @overload\n    def __init__(self, value: dict[int, float], dimensions: int, /) -> None: ...\n\n    @overload\n    def __init__(self, value: list[float] | ndarray | sparray | spmatrix, /) -> None: ...\n\n    def __init__(\n        self,\n        value: dict[int, float] | list[float] | ndarray | sparray | spmatrix,\n        dimensions: int | Sentinel = NO_DEFAULT,\n        /\n    ) -> None:\n        if is_sparse_array(value):\n            if dimensions is not NO_DEFAULT:\n                raise ValueError('extra argument')\n\n            self._from_sparse(value)  # type: ignore\n        elif isinstance(value, dict):\n            if dimensions is NO_DEFAULT:\n                raise ValueError('missing dimensions')\n\n            self._from_dict(value, dimensions)  # type: ignore\n        else:\n            if dimensions is not NO_DEFAULT:\n                raise ValueError('extra argument')\n\n            self._from_dense(value)  # type: ignore\n\n    def __repr__(self) -> str:\n        elements = dict(zip(self._indices, self._values))\n        return f'SparseVector({elements}, {self._dim})'\n\n    def __eq__(self, other: object, /) -> bool:\n        if not isinstance(other, self.__class__):\n            return NotImplemented\n        return self._dim == other._dim and self._indices == other._indices and self._values == other._values\n\n    def dimensions(self) -> int:\n        return self._dim\n\n    def indices(self) -> list[int]:\n        return self._indices\n\n    def values(self) -> list[float]:\n        return self._values\n\n    def to_coo(self) -> coo_array:\n        from scipy.sparse import coo_array\n\n        coords = ([0] * len(self._indices), self._indices)\n        return coo_array((self._values, coords), shape=(1, self._dim))\n\n    def to_list(self) -> list[float]:\n        vec = [0.0] * self._dim\n        for i, v in zip(self._indices, self._values):\n            vec[i] = v\n        return vec\n\n    def to_numpy(self) -> np.ndarray[tuple[int, ...], np.dtype[np.float32]]:\n        import numpy as np\n\n        vec = np.zeros(self._dim, dtype=np.float32)\n        for i, v in zip(self._indices, self._values):\n            vec[i] = v\n        return vec\n\n    def to_text(self) -> str:\n        elements = ','.join([f'{int(i) + 1}:{float(v)}' for i, v in zip(self._indices, self._values)])\n        return f'{{{elements}}}/{int(self._dim)}'\n\n    def to_binary(self) -> bytes:\n        nnz = len(self._indices)\n        return pack(f'>iii{nnz}i{nnz}f', self._dim, nnz, 0, *self._indices, *self._values)\n\n    def _from_dict(self, d: dict[int, float], dim: int) -> None:\n        elements = [(i, v) for i, v in d.items() if v != 0]\n        elements.sort()\n\n        self._dim = int(dim)\n        self._indices = [int(v[0]) for v in elements]\n        self._values = [float(v[1]) for v in elements]\n        # TODO uncomment in 0.6.0\n        # self._validate()\n\n    def _from_sparse(self, arr: sparray | spmatrix, /) -> None:\n        value: coo_array | coo_matrix = arr.tocoo(copy=False)  # type: ignore\n\n        # has_canonical_format added in scipy 1.12+\n        if not hasattr(value, 'has_canonical_format') or not value.has_canonical_format:\n            value = value.copy()\n            value.sum_duplicates()\n\n        shape = cast(tuple[int, ...], value.shape)\n        if len(shape) == 1:\n            self._dim = shape[0]\n        elif len(shape) == 2 and shape[0] == 1:\n            self._dim = shape[1]\n        else:\n            raise ValueError('expected ndim to be 1')\n\n        if hasattr(value, 'coords'):\n            # scipy 1.13+\n            indices = value.coords[-1].tolist()\n        else:\n            indices = value.col.tolist()\n\n        elements = [(i, v) for i, v in zip(indices, value.data) if v != 0]\n\n        # has_canonical_format added in scipy 1.12+\n        if not hasattr(value, 'has_canonical_format') or not value.has_canonical_format:\n            elements.sort()\n\n        self._indices = [v[0] for v in elements]\n        self._values = [float(v[1]) for v in elements]\n\n    def _from_dense(self, value: list[float] | ndarray, /) -> None:\n        self._dim = len(value)\n        self._indices = []\n        self._values = []\n        for i, v in enumerate(value):\n            v = float(v)\n            if v != 0:\n                self._indices.append(i)\n                self._values.append(v)\n\n    def _validate(self) -> None:\n        if self._dim < 0:\n            raise ValueError('sparsevec cannot have negative dimensions')\n\n        if any(i < 0 or i >= self._dim for i in self._indices):\n            raise ValueError('sparsevec index out of bounds')\n\n    def _validate_sorted(self) -> None:\n        for i in range(len(self._indices) - 1):\n            if self._indices[i] >= self._indices[i + 1]:\n                raise ValueError('sparsevec indices must be in ascending order')\n\n    @classmethod\n    def from_text(cls, value: str, /) -> SparseVector:\n        elements, dim = value.split('/', 2)\n        indices: list[int] = []\n        values: list[float] = []\n        # split on empty string returns single element list\n        if len(elements) > 2:\n            for e in elements[1:-1].split(','):\n                i, v = e.split(':', 2)\n                indices.append(int(i) - 1)\n                values.append(float(v))\n        return cls._from_parts(int(dim), indices, values)\n\n    @classmethod\n    def from_binary(cls, value: bytes | bytearray | memoryview, /) -> SparseVector:\n        dim, nnz, unused = unpack_from('>iii', value)\n\n        if len(value) != 12 + 8 * nnz:\n            raise ValueError('invalid length')\n\n        if unused != 0:\n            raise ValueError('expected unused to be 0')\n\n        indices = list(unpack_from(f'>{nnz}i', value, 12))\n        values = list(unpack_from(f'>{nnz}f', value, 12 + nnz * 4))\n        return cls._from_parts(dim, indices, values)\n\n    @classmethod\n    def _from_parts(cls, dim: int, indices: list[int], values: list[float], /) -> SparseVector:\n        vec = cls.__new__(cls)\n        vec._dim = dim\n        vec._indices = indices\n        vec._values = values\n        # TODO uncomment in 0.6.0\n        # vec._validate()\n        # vec._validate_sorted()\n        return vec\n\n    @classmethod\n    def _to_db(cls, value: list[float] | ndarray | sparray | spmatrix | SparseVector | None, /) -> str | None:\n        if value is None:\n            return value\n\n        if not isinstance(value, SparseVector):\n            value = cls(value)\n\n        return value.to_text()\n\n    @classmethod\n    def _from_db(cls, value: str | SparseVector | None, /) -> SparseVector | None:\n        if value is None or isinstance(value, SparseVector):\n            return value\n\n        return cls.from_text(value)\nfrom __future__ import annotations\nfrom struct import pack, unpack_from\nfrom typing import TYPE_CHECKING\nfrom ._utils import is_ndarray\n\nif TYPE_CHECKING:\n    import numpy as np\n\n\nclass Bit:\n    _length: int\n    _data: bytes\n\n    def __init__(\n        self,\n        value: bytes | str | list[bool] | np.ndarray[tuple[int, ...], np.dtype[np.bool_ | np.uint8]],\n        /\n    ) -> None:\n        if isinstance(value, bytes):\n            self._length = 8 * len(value)\n            self._data = value\n        elif isinstance(value, (list, str)):\n            if isinstance(value, list):\n                bits = {True: '1', False: '0'}\n                try:\n                    value = ''.join([bits[v] for v in value])\n                except (KeyError, TypeError):\n                    raise ValueError('expected list[bool]')\n            elif not set(value).issubset({'0', '1'}):\n                raise ValueError('expected bit string')\n\n            length = len(value)\n            if length % 8 != 0:\n                value += '0' * (8 - (length % 8))\n\n            self._length = length\n            if length > 0:\n                self._data = int(value, 2).to_bytes(len(value) // 8, byteorder='big')\n            else:\n                self._data = b''\n        elif is_ndarray(value):\n            import numpy as np\n\n            if value.dtype != np.bool_:\n                # skip error for result of np.unpackbits\n                if value.dtype != np.uint8 or np.any(value > 1):\n                    raise ValueError('expected elements to be boolean')\n                value = value.astype(bool)\n\n            if value.ndim != 1:\n                raise ValueError('expected ndim to be 1')\n\n            self._length = len(value)\n            self._data = np.packbits(value).tobytes()  # type: ignore\n        else:\n            raise ValueError('expected bytes, str, list, or ndarray')\n\n    def __repr__(self) -> str:\n        return f'Bit({self.to_text()})'\n\n    def __eq__(self, other: object, /) -> bool:\n        if not isinstance(other, self.__class__):\n            return NotImplemented\n        return self._length == other._length and self._data == other._data\n\n    def to_list(self) -> list[bool]:\n        # TODO improve\n        return [v != '0' for v in self.to_text()]\n\n    def to_numpy(self) -> np.ndarray[tuple[int, ...], np.dtype[np.bool_]]:\n        import numpy as np\n\n        return np.unpackbits(np.frombuffer(self._data, dtype=np.uint8), count=self._length).astype(bool)\n\n    def to_text(self) -> str:\n        return ''.join(format(v, '08b') for v in self._data)[:self._length]\n\n    def to_binary(self) -> bytes:\n        return pack('>i', self._length) + self._data\n\n    @classmethod\n    def from_text(cls, value: str, /) -> Bit:\n        # cast to ensure always uses str constructor\n        return cls(str(value))\n\n    @classmethod\n    def from_binary(cls, value: bytes | bytearray | memoryview, /) -> Bit:\n        length, = unpack_from('>i', value)\n        data = memoryview(value)[4:].tobytes()\n\n        if length < 0 or len(data) != (length + 7) // 8:\n            raise ValueError('invalid length')\n\n        bit = cls.__new__(cls)\n        bit._length = length\n        bit._data = data\n        return bit\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 10448,
+        "completion_tokens": 131,
+        "cached_tokens": 10444,
+        "extra": {
+          "cache_write_tokens": 308
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 3,
+      "timestamp": "2026-11-25T17:35:32.979000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01SdvS6Dy3EwiEd6QMnPoy2X",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && cat pgvector/_utils.py && head -40 CHANGELOG.md && cat tests/test_vector.py tests/test_sparse_vector.py && grep -n \"nan\\|inf\\|binary\" tests/test_half_vector.py tests/test_bit.py; cat Makefile; pip list 2>/dev/null | grep -i -E \"numpy|scipy|pytest|mypy\""
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01SdvS6Dy3EwiEd6QMnPoy2X",
+            "content": "import sys\nfrom typing import TYPE_CHECKING, TypeAlias\n\nif TYPE_CHECKING:\n    import numpy as np\n\n    ndarray: TypeAlias = np.ndarray[tuple[int, ...], np.dtype[np.floating]]\nelse:\n    # any value works since not type checking\n    # TODO use Never when Python 3.10 no longer supported\n    ndarray = None\n\n\ndef is_ndarray(value: object, /) -> bool:\n    if (numpy := sys.modules.get('numpy')):\n        return isinstance(value, numpy.ndarray)\n    return False\n\n\ndef is_sparse_array(value: object, /) -> bool:\n    if (sparse := sys.modules.get('scipy.sparse')):\n        return isinstance(value, (sparse.sparray, sparse.spmatrix))\n    return False\n## 0.5.2 (unreleased)\n\n- Fixed memory leak with `register_vector` and `register_vector_async` for Psycopg 3\n- Fixed error with `Bit` constructor and empty strings\n- Fixed equality for `HalfVector` with signed zeros\n\n## 0.5.1 (2026-10-08)\n\n- Fixed error with non-canonical SciPy sparse arrays\n- Fixed error with SciPy sparse arrays with explicit zeros\n- Fixed error with `Bit` constructor for NumPy 1.24-1.26\n\n## 0.5.0 (2026-07-06)\n\n- Added experimental support for type hints\n- Changed `vector` and `halfvec` types to return list for Django, SQLAlchemy, SQLModel, and Peewee\n- Changed `vector` type to return `Vector` object for Psycopg 3, Psycopg 2, asyncpg, and pg8000\n- Removed `utils` package (use top-level `pgvector` package instead)\n- Removed re-exported classes (use top-level `pgvector` package instead)\n- Removed dependency on NumPy\n- Dropped support for Python < 3.10\n- Dropped support for SQLAlchemy < 2\n\n## 0.4.2 (2025-12-04)\n\n- Added support for Django 6\n- Added support for `str` objects for `bit` type with SQLAlchemy\n\n## 0.4.1 (2025-04-26)\n\n- Fixed `SparseVector` constructor for SciPy sparse matrices\n\n## 0.4.0 (2025-03-15)\n\n- Added top-level `pgvector` package\n- Added support for pg8000\n- Added support for `bytes` to `Bit` constructor\n- Changed `globally` option to default to `False` for Psycopg 2\n- Changed `arrays` option to default to `True` for Psycopg 2\n- Fixed equality for `Vector`, `HalfVector`, `Bit`, and `SparseVector` classes\nfrom pgvector import Vector\nimport pytest\nimport struct\nfrom .conftest import numpy as np\n\n\nclass TestVector:\n    def test_init_list(self) -> None:\n        arr = [1.0, 2.0, 3.0]\n        assert Vector(arr).to_list() == arr\n        assert Vector(arr).to_list() is not arr\n\n    def test_init_list_empty(self) -> None:\n        assert Vector([]).to_list() == []\n\n    def test_init_list_str(self) -> None:\n        with pytest.raises(ValueError) as error:\n            Vector([1, 'two', 3])  # type: ignore\n        assert str(error.value) == 'expected list[float]'\n\n    def test_init_list_list(self) -> None:\n        with pytest.raises(ValueError) as error:\n            Vector([[1, 2], [3, 4]])  # type: ignore\n        assert str(error.value) == 'expected list[float]'\n\n    def test_init_ndarray(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = np.array([1, 2, 3], dtype=np.float32)\n        assert Vector(arr).to_list() == [1, 2, 3]\n        assert Vector(arr).to_numpy() is not arr\n        assert Vector(arr).to_numpy().dtype == np.float32\n\n    def test_init_ndarray_non_contiguous(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = np.array([1, 2, 3], dtype=np.float32)\n        assert Vector(np.flip(arr)).to_list() == [3, 2, 1]\n        assert Vector(np.flip(arr)).to_binary() == Vector([3, 2, 1]).to_binary()\n\n    def test_init_ndarray_big_endian(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = np.array([1, 2, 3], dtype=np.float32)\n        assert Vector(arr.astype('>f4')).to_list() == [1, 2, 3]\n        assert Vector(arr.astype('>f4')).to_binary() == Vector([1, 2, 3]).to_binary()\n\n    def test_init_ndarray_str(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        with pytest.raises(ValueError) as error:\n            Vector(np.array(['one', 'two', 'three']))\n        assert 'could not convert string to float' in str(error.value)\n\n    def test_init_int(self) -> None:\n        with pytest.raises(ValueError) as error:\n            Vector(1)  # type: ignore\n        assert str(error.value) == 'expected list or ndarray'\n\n    def test_repr(self) -> None:\n        assert repr(Vector([1, 2, 3])) == 'Vector([1.0, 2.0, 3.0])'\n        assert str(Vector([1, 2, 3])) == 'Vector([1.0, 2.0, 3.0])'\n\n    def test_eq(self) -> None:\n        assert Vector([1, 2, 3]) == Vector([1, 2, 3])\n        assert Vector([1, 2, 3]) != Vector([1, 2, 4])\n        assert Vector([1, 2, 3]) != 1\n        assert Vector([0.0]) == Vector([-0.0])\n\n    def test_dimensions(self) -> None:\n        assert Vector([1, 2, 3]).dimensions() == 3\n\n    def test_to_list(self) -> None:\n        assert Vector([1.5, 2, 3]).to_list() == [1.5, 2, 3]\n\n    def test_to_numpy(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = Vector([1.5, 2, 3]).to_numpy()\n        assert np.array_equal(arr, np.array([1.5, 2, 3]))\n        assert arr.dtype == np.float32\n\n    def test_to_text(self) -> None:\n        assert Vector([1.5, 2, 3]).to_text() == '[1.5,2.0,3.0]'\n\n    def test_to_binary(self) -> None:\n        assert Vector([1.5, 2, 3]).to_binary() == struct.pack('>hh3f', 3, 0, 1.5, 2, 3)\n\n    def test_from_text(self) -> None:\n        assert Vector.from_text('[1.5,2,3]') == Vector([1.5, 2, 3])\n\n    def test_from_text_zero_length(self) -> None:\n        with pytest.raises(ValueError, match='could not convert string to float'):\n            Vector.from_text('')\n\n    def test_from_text_zero_dimensions(self) -> None:\n        assert Vector.from_text('[]') == Vector([])\n\n    def test_from_text_open_bracket(self) -> None:\n        # TODO raise ValueError in 0.6.0\n        assert Vector.from_text('{1]')\n\n    def test_from_text_close_bracket(self) -> None:\n        # TODO raise ValueError in 0.6.0\n        assert Vector.from_text('[1}')\n\n    def test_from_text_non_number(self) -> None:\n        with pytest.raises(ValueError, match='could not convert string to float'):\n            assert Vector.from_text('[a]')\n\n    def test_from_binary(self) -> None:\n        assert Vector.from_binary(struct.pack('>hh3f', 3, 0, 1.5, 2, 3)) == Vector([1.5, 2, 3])\n\n    def test_from_binary_zero_length(self) -> None:\n        # TODO change to ValueError('invalid length') in 0.6.0\n        with pytest.raises(struct.error, match='unpack_from requires a buffer of at least 4 bytes'):\n            Vector.from_binary(b'')\n\n    def test_from_binary_missing_data(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            Vector.from_binary(struct.pack('>hhf', 2, 0, 1))\n\n    def test_from_binary_extra_data(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            Vector.from_binary(struct.pack('>hhfff', 2, 0, 1, 2, 3))\n\n    def test_from_binary_negative_dimensions(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            Vector.from_binary(struct.pack('>hh', -1, 0))\n\n    def test_from_binary_non_zero_unused(self) -> None:\n        with pytest.raises(ValueError, match='expected unused to be 0'):\n            Vector.from_binary(struct.pack('>hh', 0, 1))\nfrom pgvector import SparseVector\nimport pytest\nimport struct\nfrom .conftest import numpy as np\n\ntry:\n    from scipy import sparse\nexcept ImportError:\n    sparse = None  # type: ignore\n\n\nclass TestSparseVector:\n    def test_init_list(self) -> None:\n        vec = SparseVector([1, 0, 2, 0, 3, 0])\n        assert vec.to_list() == [1, 0, 2, 0, 3, 0]\n        if np is not None:\n            assert np.array_equal(vec.to_numpy(), [1, 0, 2, 0, 3, 0])\n        assert vec.indices() == [0, 2, 4]\n\n    def test_init_list_empty(self) -> None:\n        assert SparseVector([]).to_list() == []\n\n    def test_init_list_str(self) -> None:\n        with pytest.raises(ValueError, match='could not convert string to float'):\n            SparseVector([1, 'two', 3])  # type: ignore\n\n    def test_init_list_dimensions(self) -> None:\n        with pytest.raises(ValueError) as error:\n            SparseVector([1, 0, 2, 0, 3, 0], 6)  # type: ignore\n        assert str(error.value) == 'extra argument'\n\n    def test_init_ndarray(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        vec = SparseVector(np.array([1, 0, 2, 0, 3, 0]))\n        assert vec.to_list() == [1, 0, 2, 0, 3, 0]\n        assert vec.indices() == [0, 2, 4]\n\n    def test_init_dict(self) -> None:\n        vec = SparseVector({2: 2, 4: 3, 0: 1, 3: 0}, 6)\n        assert vec.to_list() == [1, 0, 2, 0, 3, 0]\n        assert vec.indices() == [0, 2, 4]\n\n    def test_init_dict_empty(self) -> None:\n        assert SparseVector({}, 0).to_list() == []\n\n    # TODO uncomment in 0.6.0\n    # def test_dict_negative_index(self) -> None:\n    #     with pytest.raises(ValueError, match='sparsevec index out of bounds'):\n    #         SparseVector({-1: 1}, 3)\n\n    # TODO uncomment in 0.6.0\n    # def test_dict_higher_index(self) -> None:\n    #     with pytest.raises(ValueError, match='sparsevec index out of bounds'):\n    #         SparseVector({3: 1}, 3)\n\n    # TODO uncomment in 0.6.0\n    # def test_dict_negative_dimensions(self) -> None:\n    #     with pytest.raises(ValueError, match='sparsevec cannot have negative dimensions'):\n    #         SparseVector({}, -1)\n\n    def test_init_dict_no_dimensions(self) -> None:\n        with pytest.raises(ValueError) as error:\n            SparseVector({0: 1, 2: 2, 4: 3})  # type: ignore\n        assert str(error.value) == 'missing dimensions'\n\n    def test_init_coo_array(self) -> None:\n        if np is None or sparse is None:\n            pytest.skip('NumPy and SciPy required')\n\n        arr = sparse.coo_array(([2, 3, 1, 0], ([2, 4, 0, 3],)), shape=(6,))\n        vec = SparseVector(arr)\n        assert vec.to_list() == [1, 0, 2, 0, 3, 0]\n        assert vec.indices() == [0, 2, 4]\n        assert isinstance(vec.values()[0], float)\n\n    def test_init_coo_array_duplicates(self) -> None:\n        if np is None or sparse is None:\n            pytest.skip('NumPy and SciPy required')\n\n        arr = sparse.coo_array(([1, 2], ([1, 1],)), shape=(3,))\n        assert arr.todense().tolist() == [0, 3, 0]\n        vec = SparseVector(arr)\n        assert vec.to_list() == [0, 3, 0]\n        assert vec.indices() == [1]\n\n    def test_init_coo_array_dimensions(self) -> None:\n        if np is None or sparse is None:\n            pytest.skip('NumPy and SciPy required')\n\n        with pytest.raises(ValueError) as error:\n            SparseVector(sparse.coo_array(np.array([1, 0, 2, 0, 3, 0])), 6)  # type: ignore\n        assert str(error.value) == 'extra argument'\n\n    def test_init_coo_matrix(self) -> None:\n        if np is None or sparse is None:\n            pytest.skip('NumPy and SciPy required')\n\n        mat = sparse.coo_matrix(np.array([1, 0, 2, 0, 3, 0]))\n        vec = SparseVector(mat)\n        assert vec.to_list() == [1, 0, 2, 0, 3, 0]\n        assert vec.indices() == [0, 2, 4]\n\n    def test_init_dok_array(self) -> None:\n        if np is None or sparse is None:\n            pytest.skip('NumPy and SciPy required')\n\n        arr = sparse.coo_array(np.array([1, 0, 2, 0, 3, 0])).todok()\n        vec = SparseVector(arr)\n        assert vec.to_list() == [1, 0, 2, 0, 3, 0]\n        assert vec.indices() == [0, 2, 4]\n\n    def test_init_csr_array(self) -> None:\n        if np is None or sparse is None:\n            pytest.skip('NumPy and SciPy required')\n\n        arr = sparse.csr_array(np.array([[1, 0, 2, 0, 3, 0]]))\n        vec = SparseVector(arr)\n        assert vec.to_list() == [1, 0, 2, 0, 3, 0]\n        assert vec.indices() == [0, 2, 4]\n\n    def test_init_csr_matrix(self) -> None:\n        if np is None or sparse is None:\n            pytest.skip('NumPy and SciPy required')\n\n        mat = sparse.csr_matrix(np.array([1, 0, 2, 0, 3, 0]))\n        vec = SparseVector(mat)\n        assert vec.to_list() == [1, 0, 2, 0, 3, 0]\n        assert vec.indices() == [0, 2, 4]\n\n    def test_repr(self) -> None:\n        assert repr(SparseVector([1, 0, 2, 0, 3, 0])) == 'SparseVector({0: 1.0, 2: 2.0, 4: 3.0}, 6)'\n        assert str(SparseVector([1, 0, 2, 0, 3, 0])) == 'SparseVector({0: 1.0, 2: 2.0, 4: 3.0}, 6)'\n\n    def test_eq(self) -> None:\n        assert SparseVector([1, 0, 2, 0, 3, 0]) == SparseVector([1, 0, 2, 0, 3, 0])\n        assert SparseVector([1, 0, 2, 0, 3, 0]) != SparseVector([1, 0, 2, 0, 3, 1])\n        assert SparseVector([1, 0, 2, 0, 3, 0]) == SparseVector({2: 2, 4: 3, 0: 1, 3: 0}, 6)\n        assert SparseVector({}, 1) != SparseVector({}, 2)\n        assert SparseVector([1, 0, 2, 0, 3, 0]) != 1\n\n    def test_dimensions(self) -> None:\n        assert SparseVector([1, 0, 2, 0, 3, 0]).dimensions() == 6\n\n    def test_indices(self) -> None:\n        assert SparseVector([1, 0, 2, 0, 3, 0]).indices() == [0, 2, 4]\n\n    def test_values(self) -> None:\n        assert SparseVector([1, 0, 2, 0, 3, 0]).values() == [1, 2, 3]\n\n    def test_to_coo(self) -> None:\n        if np is None or sparse is None:\n            pytest.skip('NumPy and SciPy required')\n\n        assert np.array_equal(SparseVector([1, 0, 2, 0, 3, 0]).to_coo().toarray(), [[1, 0, 2, 0, 3, 0]])\n\n    def test_to_list(self) -> None:\n        assert SparseVector({2: 2, 4: 3, 0: 1.5, 3: 0}, 6).to_list() == [1.5, 0, 2, 0, 3, 0]\n\n    def test_to_numpy(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = SparseVector({2: 2, 4: 3, 0: 1.5, 3: 0}, 6).to_numpy()\n        assert np.array_equal(arr, np.array([1.5, 0, 2, 0, 3, 0]))\n        assert arr.dtype == np.float32\n\n    def test_to_text(self) -> None:\n        assert SparseVector({2: 2, 4: 3, 0: 1.5, 3: 0}, 6).to_text() == '{1:1.5,3:2.0,5:3.0}/6'\n\n    def test_to_binary(self) -> None:\n        assert SparseVector({2: 2, 4: 3, 0: 1.5, 3: 0}, 6).to_binary() == struct.pack('>iii3i3f', 6, 3, 0, 0, 2, 4, 1.5, 2, 3)\n\n    def test_from_text(self) -> None:\n        assert SparseVector.from_text('{1:1.5,3:2,5:3}/6') == SparseVector([1.5, 0, 2, 0, 3, 0])\n\n    def test_from_text_zero_length(self) -> None:\n        with pytest.raises(ValueError, match='not enough values to unpack'):\n            SparseVector.from_text('')\n\n    def test_from_text_zero_dimensions(self) -> None:\n        assert SparseVector.from_text('{}/0') == SparseVector([])\n\n    def test_from_text_non_number_index(self) -> None:\n        with pytest.raises(ValueError, match='invalid literal for int'):\n            assert SparseVector.from_text('{a:1}/1')\n\n    def test_from_text_non_number_value(self) -> None:\n        with pytest.raises(ValueError, match='could not convert string to float'):\n            assert SparseVector.from_text('{1:a}/1')\n\n    # TODO uncomment in 0.6.0\n    # def test_from_text_unsorted(self) -> None:\n    #     with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):\n    #         SparseVector.from_text('{2:1,1:1}/3')\n\n    # TODO uncomment in 0.6.0\n    # def test_from_text_duplicate(self) -> None:\n    #     with pytest.raises(ValueError, match='sparsevec indices must be in ascending order'):\n    #         SparseVector.from_text('{2:1,2:1}/3')\n\n    def test_from_binary(self) -> None:\n        data = struct.pack('>iii3i3f', 6, 3, 0, 0, 2, 4, 1.5, 2, 3)\n        assert SparseVector.from_binary(data) == SparseVector([1.5, 0, 2, 0, 3, 0])\n\n    def test_from_binary_zero_length(self) -> None:\n        # TODO change to ValueError('invalid length') in 0.6.0\n        with pytest.raises(struct.error, match='unpack_from requires a buffer of at least 12 bytes'):\n            SparseVector.from_binary(b'')\n\n    def test_from_binary_missing_data(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            SparseVector.from_binary(struct.pack('>iii2if', 2, 2, 0, 0, 1, 1))\n\n    def test_from_binary_extra_data(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            SparseVector.from_binary(struct.pack('>iii2ifff', 2, 2, 0, 0, 1, 1, 2, 3))\n\n    def test_from_binary_negative_nnz(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            SparseVector.from_binary(struct.pack('>iii', 0, -1, 0))\n\n    def test_from_binary_non_zero_unused(self) -> None:\n        with pytest.raises(ValueError, match='expected unused to be 0'):\n            SparseVector.from_binary(struct.pack('>iii', 0, 0, 1))\ntests/test_half_vector.py:41:        assert HalfVector(np.flip(arr)).to_binary() == HalfVector([3, 2, 1]).to_binary()\ntests/test_half_vector.py:49:        assert HalfVector(arr.astype('>f2')).to_binary() == HalfVector([1, 2, 3]).to_binary()\ntests/test_half_vector.py:91:    def test_to_binary(self) -> None:\ntests/test_half_vector.py:92:        assert HalfVector([1.5, 2, 3]).to_binary() == struct.pack('>hh3e', 3, 0, 1.5, 2, 3)\ntests/test_half_vector.py:116:    def test_from_binary(self) -> None:\ntests/test_half_vector.py:117:        assert HalfVector.from_binary(struct.pack('>hh3e', 3, 0, 1.5, 2, 3)) == HalfVector([1.5, 2, 3])\ntests/test_half_vector.py:119:    def test_from_binary_zero_length(self) -> None:\ntests/test_half_vector.py:122:            HalfVector.from_binary(b'')\ntests/test_half_vector.py:124:    def test_from_binary_missing_data(self) -> None:\ntests/test_half_vector.py:126:            HalfVector.from_binary(struct.pack('>hhe', 2, 0, 1))\ntests/test_half_vector.py:128:    def test_from_binary_extra_data(self) -> None:\ntests/test_half_vector.py:130:            HalfVector.from_binary(struct.pack('>hheee', 2, 0, 1, 2, 3))\ntests/test_half_vector.py:132:    def test_from_binary_negative_dimensions(self) -> None:\ntests/test_half_vector.py:134:            HalfVector.from_binary(struct.pack('>hh', -1, 0))\ntests/test_half_vector.py:136:    def test_from_binary_non_zero_unused(self) -> None:\ntests/test_half_vector.py:138:            HalfVector.from_binary(struct.pack('>hh', 0, 1))\ntests/test_bit.py:113:    def test_to_binary(self) -> None:\ntests/test_bit.py:114:        assert Bit('101').to_binary() == struct.pack('>iB', 3, 5 << 5)\ntests/test_bit.py:126:    def test_from_binary(self) -> None:\ntests/test_bit.py:127:        assert Bit.from_binary(struct.pack('>iB', 3, 5 << 5)) == Bit('101')\ntests/test_bit.py:129:    def test_from_binary_zero_length(self) -> None:\ntests/test_bit.py:132:            Bit.from_binary(b'')\ntests/test_bit.py:134:    def test_from_binary_missing_data(self) -> None:\ntests/test_bit.py:136:            Bit.from_binary(struct.pack('>iB', 9, 0))\ntests/test_bit.py:138:    def test_from_binary_extra_data(self) -> None:\ntests/test_bit.py:140:            Bit.from_binary(struct.pack('>iBBB', 16, 0, 0, 0))\ntests/test_bit.py:142:    def test_from_binary_negative_length(self) -> None:\ntests/test_bit.py:144:            Bit.from_binary(struct.pack('>i', -1))\n.PHONY: lint build publish clean\n\nlint:\n\tpycodestyle . --ignore=E501,E704,W504 --exclude=.venv\n\nbuild:\n\tpython3 -m build\n\npublish: clean build\n\ttwine upload dist/*\n\nclean:\n\trm -rf .pytest_cache dist pgvector.egg-info\nnumpy             2.5.5\npytest            9.2.0\npytest-asyncio    1.5.0\nscipy             1.18.1\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 10754,
+        "completion_tokens": 11201,
+        "cached_tokens": 10752,
+        "extra": {
+          "cache_write_tokens": 6786
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 4,
+      "timestamp": "2026-11-25T17:35:52.071000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01752UxGo71kZPDXSYTYbGp5",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && cat tests/test_bit.py tests/test_half_vector.py | head -120; python -c \"\nfrom array import array; print(array('f',[1e40]))\nimport struct\ntry: struct.pack('e',1e10)\nexcept Exception as e: print(type(e),e)\ntry: struct.pack('f',1e40)\nexcept Exception as e: print(type(e),e)\ntry: array('f',[10**400])\nexcept Exception as e: print(type(e),e)\n\""
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01752UxGo71kZPDXSYTYbGp5",
+            "content": "from pgvector import Bit\nimport pytest\nimport random\nimport struct\nfrom .conftest import numpy as np\n\n\nclass TestBit:\n    def test_init_list(self) -> None:\n        assert Bit([True, False, True]).to_list() == [True, False, True]\n\n    def test_init_list_empty(self) -> None:\n        assert Bit([]).to_list() == []\n\n    def test_init_list_none(self) -> None:\n        with pytest.raises(ValueError) as error:\n            Bit([True, None, True])  # type: ignore\n        assert str(error.value) == 'expected list[bool]'\n\n    def test_init_list_int(self) -> None:\n        with pytest.raises(ValueError) as error:\n            Bit([254, 7, 0])  # type: ignore\n        assert str(error.value) == 'expected list[bool]'\n\n    def test_init_list_list(self) -> None:\n        with pytest.raises(ValueError) as error:\n            Bit([[True, False], [True, False]])  # type: ignore\n        assert str(error.value) == 'expected list[bool]'\n\n    def test_init_str(self) -> None:\n        assert Bit('101').to_list() == [True, False, True]\n\n    def test_init_str_empty(self) -> None:\n        assert Bit('').to_list() == []\n\n    def test_init_str_two(self) -> None:\n        with pytest.raises(ValueError) as error:\n            Bit('201')\n        assert str(error.value) == 'expected bit string'\n\n    def test_init_bytes(self) -> None:\n        assert Bit(b'\\xff\\x00\\xf0').to_text() == '111111110000000011110000'\n        assert Bit(b'\\xfe\\x07\\x00').to_text() == '111111100000011100000000'\n\n    def test_init_bytes_empty(self) -> None:\n        assert Bit(b'').to_text() == ''\n\n    def test_init_ndarray(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = np.array([True, False, True])\n        assert Bit(arr).to_list() == [True, False, True]\n        assert np.array_equal(Bit(arr).to_numpy(), arr)\n\n    def test_init_ndarray_unpackbits(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = np.unpackbits(np.array([254, 7, 0], dtype=np.uint8))\n        assert Bit(arr).to_text() == '111111100000011100000000'\n\n    def test_init_ndarray_uint8(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = np.array([254, 7, 0], dtype=np.uint8)\n        with pytest.raises(ValueError) as error:\n            Bit(arr)\n        assert str(error.value) == 'expected elements to be boolean'\n\n    def test_init_ndarray_uint16(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = np.array([254, 7, 0], dtype=np.uint16)\n        with pytest.raises(ValueError) as error:\n            Bit(arr)  # type: ignore\n        assert str(error.value) == 'expected elements to be boolean'\n\n    def test_init_bool(self) -> None:\n        with pytest.raises(ValueError) as error:\n            Bit(True)  # type: ignore\n        assert str(error.value) == 'expected bytes, str, list, or ndarray'\n\n    def test_init_random(self) -> None:\n        value = ''.join(random.choices(['0', '1'], k=random.randint(1024, 2048)))\n        assert Bit(value).to_text() == value\n\n    def test_repr(self) -> None:\n        assert repr(Bit([True, False, True])) == 'Bit(101)'\n        assert str(Bit([True, False, True])) == 'Bit(101)'\n\n    def test_eq(self) -> None:\n        assert Bit([True, False, True]) == Bit([True, False, True])\n        assert Bit([True, False, True]) != Bit([True, False, False])\n        assert Bit([True, False, True]) != 1\n\n    def test_to_list(self) -> None:\n        assert Bit('101').to_list() == [True, False, True]\n\n    def test_to_numpy(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        arr = Bit('101').to_numpy()\n        assert np.array_equal(arr, np.array([True, False, True]))\n        assert arr.dtype == np.bool_\n\n    def test_to_text(self) -> None:\n        assert Bit('101').to_text() == '101'\n\n    def test_to_binary(self) -> None:\n        assert Bit('101').to_binary() == struct.pack('>iB', 3, 5 << 5)\n\n    def test_from_text(self) -> None:\n        assert Bit.from_text('101') == Bit('101')\n\n    def test_from_text_zero_length(self) -> None:\n        assert Bit.from_text('') == Bit([])\narray('f', [inf])\n<class 'OverflowError'> float too large to pack with e format\n<class 'OverflowError'> int too large to convert to float\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 17540,
+        "completion_tokens": 509,
+        "cached_tokens": 17538,
+        "extra": {
+          "cache_write_tokens": 19968
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 5,
+      "timestamp": "2026-11-25T17:36:23.069000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01WWQWNjaN4cAP8gtBKq8j53",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && sed -n 120,200p tests/test_half_vector.py; sed -n 120,200p tests/test_bit.py; cat tests/conftest.py"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01WWQWNjaN4cAP8gtBKq8j53",
+            "content": "        # TODO change to ValueError('invalid length') in 0.6.0\n        with pytest.raises(struct.error, match='unpack_from requires a buffer of at least 4 bytes'):\n            HalfVector.from_binary(b'')\n\n    def test_from_binary_missing_data(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            HalfVector.from_binary(struct.pack('>hhe', 2, 0, 1))\n\n    def test_from_binary_extra_data(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            HalfVector.from_binary(struct.pack('>hheee', 2, 0, 1, 2, 3))\n\n    def test_from_binary_negative_dimensions(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            HalfVector.from_binary(struct.pack('>hh', -1, 0))\n\n    def test_from_binary_non_zero_unused(self) -> None:\n        with pytest.raises(ValueError, match='expected unused to be 0'):\n            HalfVector.from_binary(struct.pack('>hh', 0, 1))\n        assert Bit.from_text('') == Bit([])\n\n    def test_from_text_invalid_character(self) -> None:\n        with pytest.raises(ValueError, match='expected bit string'):\n            Bit.from_text('2')\n\n    def test_from_binary(self) -> None:\n        assert Bit.from_binary(struct.pack('>iB', 3, 5 << 5)) == Bit('101')\n\n    def test_from_binary_zero_length(self) -> None:\n        # TODO change to ValueError('invalid length') in 0.6.0\n        with pytest.raises(struct.error, match='unpack_from requires a buffer of at least 4 bytes'):\n            Bit.from_binary(b'')\n\n    def test_from_binary_missing_data(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            Bit.from_binary(struct.pack('>iB', 9, 0))\n\n    def test_from_binary_extra_data(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            Bit.from_binary(struct.pack('>iBBB', 16, 0, 0, 0))\n\n    def test_from_binary_negative_length(self) -> None:\n        with pytest.raises(ValueError, match='invalid length'):\n            Bit.from_binary(struct.pack('>i', -1))\ntry:\n    import numpy\nexcept ImportError:\n    numpy = None  # type: ignore\n\n__all__ = [\n    'numpy'\n]\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 37508,
+        "completion_tokens": 2768,
+        "cached_tokens": 37506,
+        "extra": {
+          "cache_write_tokens": 2226
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 6,
+      "timestamp": "2026-11-25T17:36:31.407000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01MN3nYuwZvhxRLYVcL2TdLC",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && cat >> pgvector/_utils.py <<'EOF'\n\n\n# max dimensions for vector and halfvec binary format (uint16)\nMAX_VECTOR_DIM = 65535\n\nINT32_MIN = -2**31\nINT32_MAX = 2**31 - 1\n\n\ndef has_nan(values: Iterable[float], /) -> bool:\n    return any(v != v for v in values)\nEOF\npython - <<'EOF'\np='pgvector/_utils.py'\ns=open(p).read()\ns=s.replace(\"from typing import TYPE_CHECKING, TypeAlias\",\"from typing import TYPE_CHECKING, Iterable, TypeAlias\")\nopen(p,'w').write(s)\nEOF"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01MN3nYuwZvhxRLYVcL2TdLC",
+            "content": "(no output)"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 39734,
+        "completion_tokens": 592,
+        "cached_tokens": 39732,
+        "extra": {
+          "cache_write_tokens": 3664
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 7,
+      "timestamp": "2026-11-25T17:36:39.713000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "Now Vector.",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01KvcZLVpyaurAwz1j1WzuCn",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && python - <<'EOF'\np='pgvector/vector.py'\ns=open(p).read()\ns=s.replace(\"from ._utils import is_ndarray, ndarray\",\"from ._utils import MAX_VECTOR_DIM, has_nan, is_ndarray, ndarray\")\ns=s.replace(\"\"\"                self._value = array('f', value)\n            except TypeError:\n                raise ValueError('expected list[float]')\"\"\",\"\"\"                self._value = array('f', value)\n            except TypeError:\n                raise ValueError('expected list[float]')\n            except OverflowError:\n                raise ValueError('value out of range for vector')\"\"\")\ns=s.replace(\"\"\"            self._value = arr\n        else:\n            raise ValueError('expected list or ndarray')\n\"\"\",\"\"\"            self._value = arr\n        else:\n            raise ValueError('expected list or ndarray')\n\n        self._validate()\n\"\"\")\ns=s.replace(\"\"\"    def __repr__\"\"\",\"\"\"    def _validate(self) -> None:\n        if len(self._value) > MAX_VECTOR_DIM:\n            raise ValueError(f'vector cannot have more than {MAX_VECTOR_DIM} dimensions')\n\n        if has_nan(self._value):\n            raise ValueError('NaN not allowed in vector')\n\n    def __repr__\"\"\",1)\ns=s.replace(\"\"\"        dim, unused = struct.unpack_from('>hh', value)\"\"\",\"\"\"        dim, unused = struct.unpack_from('>HH', value)\"\"\")\ns=s.replace(\"\"\"        vec = cls.__new__(cls)\n        vec._value = arr\n        return vec\"\"\",\"\"\"        vec = cls.__new__(cls)\n        vec._value = arr\n        vec._validate()\n        return vec\"\"\")\nopen(p,'w').write(s)\n\np='pgvector/halfvec.py'\ns=open(p).read()\ns=s.replace(\"from ._utils import is_ndarray, ndarray\",\"from ._utils import MAX_VECTOR_DIM, is_ndarray, ndarray\")\ns=s.replace(\"\"\"            except struct.error:\n                raise ValueError('expected list[float]')\"\"\",\"\"\"            except struct.error:\n                raise ValueError('expected list[float]')\n            except OverflowError:\n                raise ValueError('value out of range for halfvec')\"\"\")\ns=s.replace(\"\"\"            self._value = arr\n        else:\n            raise ValueError('expected list or ndarray')\n\"\"\",\"\"\"            self._value = arr\n        else:\n            raise ValueError('expected list or ndarray')\n\n        self._validate()\n\"\"\")\ns=s.replace(\"\"\"    def __repr__\"\"\",\"\"\"    def _validate(self) -> None:\n        if len(self._value) > MAX_VECTOR_DIM:\n            raise ValueError(f'halfvec cannot have more than {MAX_VECTOR_DIM} dimensions')\n\n        # exponent bits all set and non-zero mantissa\n        if any((v & 0x7c00) == 0x7c00 and (v & 0x03ff) != 0 for v in self._value):\n            raise ValueError('NaN not allowed in halfvec')\n\n    def __repr__\"\"\",1)\ns=s.replace(\"\"\"        dim, unused = struct.unpack_from('>hh', value)\"\"\",\"\"\"        dim, unused = struct.unpack_from('>HH', value)\"\"\")\ns=s.replace(\"\"\"        vec = cls.__new__(cls)\n        vec._value = arr\n        return vec\"\"\",\"\"\"        vec = cls.__new__(cls)\n        vec._value = arr\n        vec._validate()\n        return vec\"\"\")\nopen(p,'w').write(s)\nEOF\ngit diff --stat"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01KvcZLVpyaurAwz1j1WzuCn",
+            "content": " pgvector/_utils.py  | 13 ++++++++++++-\n pgvector/halfvec.py | 17 +++++++++++++++--\n pgvector/vector.py  | 16 ++++++++++++++--\n 3 files changed, 41 insertions(+), 5 deletions(-)\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 43398,
+        "completion_tokens": 1227,
+        "cached_tokens": 43396,
+        "extra": {
+          "cache_write_tokens": 601
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 8,
+      "timestamp": "2026-11-25T17:36:50.860000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "Now SparseVector.",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01CXhhLgVw9X5eTkHsjKJKET",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && python - <<'EOF'\np='pgvector/sparsevec.py'\ns=open(p).read()\ns=s.replace(\"\"\"from struct import pack, unpack_from\nfrom typing import TYPE_CHECKING, Final, cast, overload\nfrom ._utils import is_sparse_array, ndarray\n\"\"\",\"\"\"from array import array\nfrom struct import pack, unpack_from\nfrom typing import TYPE_CHECKING, Final, cast, overload\nfrom ._utils import INT32_MAX, INT32_MIN, has_nan, is_sparse_array, ndarray\n\"\"\")\ns=s.replace(\"\"\"            self._from_dense(value)  # type: ignore\n\n\"\"\",\"\"\"            self._from_dense(value)  # type: ignore\n\n        self._validate_binary()\n\n\"\"\")\n# dict\ns=s.replace(\"\"\"    def _from_dict(self, d: dict[int, float], dim: int) -> None:\n        elements = [(i, v) for i, v in d.items() if v != 0]\n        elements.sort()\n\n        self._dim = int(dim)\n        self._indices = [int(v[0]) for v in elements]\n        self._values = [float(v[1]) for v in elements]\n\"\"\",\"\"\"    def _from_dict(self, d: dict[int, float], dim: int) -> None:\n        elements = [(i, v) for i, v in d.items() if v != 0]\n        elements.sort()\n\n        self._dim = _to_int(dim)\n        self._indices = [_to_int(v[0]) for v in elements]\n        self._values = [float(v[1]) for v in elements]\n        self._round_values()\n\"\"\")\ns=s.replace(\"\"\"        self._indices = [v[0] for v in elements]\n        self._values = [float(v[1]) for v in elements]\n\"\"\",\"\"\"        self._indices = [v[0] for v in elements]\n        self._values = [float(v[1]) for v in elements]\n        self._round_values()\n\"\"\")\ns=s.replace(\"\"\"            if v != 0:\n                self._indices.append(i)\n                self._values.append(v)\n\"\"\",\"\"\"            if v != 0:\n                self._indices.append(i)\n                self._values.append(v)\n        self._round_values()\n\n    def _round_values(self) -> None:\n        # store as float32 like Postgres (and binary format)\n        values = _to_float32(self._values)\n        if 0 in values:\n            # remove values that underflow to zero\n            elements = [(i, v) for i, v in zip(self._indices, values) if v != 0]\n            self._indices = [v[0] for v in elements]\n            values = [v[1] for v in elements]\n        self._values = values\n\n    def _validate_binary(self) -> None:\n        if self._dim < INT32_MIN or self._dim > INT32_MAX:\n            raise ValueError('sparsevec dimensions out of range')\n\n        if any(i < INT32_MIN or i > INT32_MAX for i in self._indices):\n            raise ValueError('sparsevec index out of range')\n\n        if has_nan(self._values):\n            raise ValueError('NaN not allowed in sparsevec')\n\"\"\")\ns=s.replace(\"\"\"                values.append(float(v))\n        return cls._from_parts(int(dim), indices, values)\"\"\",\"\"\"                values.append(float(v))\n        return cls._from_parts(int(dim), indices, _to_float32(values))\"\"\")\ns=s.replace(\"\"\"        vec._values = values\n        # TODO\"\"\",\"\"\"        vec._values = values\n        vec._validate_binary()\n        # TODO\"\"\")\ns+='''\n\ndef _to_int(value: int, /) -> int:\n    try:\n        return int(value)\n    except OverflowError:\n        raise ValueError('cannot convert to int')\n\n\ndef _to_float32(values: list[float], /) -> list[float]:\n    return array('f', values).tolist()\n'''\nopen(p,'w').write(s)\nEOF\ngit diff pgvector/sparsevec.py"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01CXhhLgVw9X5eTkHsjKJKET",
+            "content": "diff --git a/pgvector/sparsevec.py b/pgvector/sparsevec.py\nindex 76e1356..16a259e 100644\n--- a/pgvector/sparsevec.py\n+++ b/pgvector/sparsevec.py\n@@ -1,7 +1,8 @@\n from __future__ import annotations\n+from array import array\n from struct import pack, unpack_from\n from typing import TYPE_CHECKING, Final, cast, overload\n-from ._utils import is_sparse_array, ndarray\n+from ._utils import INT32_MAX, INT32_MIN, has_nan, is_sparse_array, ndarray\n \n if TYPE_CHECKING:\n     import numpy as np\n@@ -48,6 +49,8 @@ class SparseVector:\n \n             self._from_dense(value)  # type: ignore\n \n+        self._validate_binary()\n+\n     def __repr__(self) -> str:\n         elements = dict(zip(self._indices, self._values))\n         return f'SparseVector({elements}, {self._dim})'\n@@ -98,9 +101,10 @@ class SparseVector:\n         elements = [(i, v) for i, v in d.items() if v != 0]\n         elements.sort()\n \n-        self._dim = int(dim)\n-        self._indices = [int(v[0]) for v in elements]\n+        self._dim = _to_int(dim)\n+        self._indices = [_to_int(v[0]) for v in elements]\n         self._values = [float(v[1]) for v in elements]\n+        self._round_values()\n         # TODO uncomment in 0.6.0\n         # self._validate()\n \n@@ -134,6 +138,7 @@ class SparseVector:\n \n         self._indices = [v[0] for v in elements]\n         self._values = [float(v[1]) for v in elements]\n+        self._round_values()\n \n     def _from_dense(self, value: list[float] | ndarray, /) -> None:\n         self._dim = len(value)\n@@ -144,6 +149,27 @@ class SparseVector:\n             if v != 0:\n                 self._indices.append(i)\n                 self._values.append(v)\n+        self._round_values()\n+\n+    def _round_values(self) -> None:\n+        # store as float32 like Postgres (and binary format)\n+        values = _to_float32(self._values)\n+        if 0 in values:\n+            # remove values that underflow to zero\n+            elements = [(i, v) for i, v in zip(self._indices, values) if v != 0]\n+            self._indices = [v[0] for v in elements]\n+            values = [v[1] for v in elements]\n+        self._values = values\n+\n+    def _validate_binary(self) -> None:\n+        if self._dim < INT32_MIN or self._dim > INT32_MAX:\n+            raise ValueError('sparsevec dimensions out of range')\n+\n+        if any(i < INT32_MIN or i > INT32_MAX for i in self._indices):\n+            raise ValueError('sparsevec index out of range')\n+\n+        if has_nan(self._values):\n+            raise ValueError('NaN not allowed in sparsevec')\n \n     def _validate(self) -> None:\n         if self._dim < 0:\n@@ -168,7 +194,7 @@ class SparseVector:\n                 i, v = e.split(':', 2)\n                 indices.append(int(i) - 1)\n                 values.append(float(v))\n-        return cls._from_parts(int(dim), indices, values)\n+        return cls._from_parts(int(dim), indices, _to_float32(values))\n \n     @classmethod\n     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> SparseVector:\n@@ -190,6 +216,7 @@ class SparseVector:\n         vec._dim = dim\n         vec._indices = indices\n         vec._values = values\n+        vec._validate_binary()\n         # TODO uncomment in 0.6.0\n         # vec._validate()\n         # vec._validate_sorted()\n@@ -211,3 +238,14 @@ class SparseVector:\n             return value\n \n         return cls.from_text(value)\n+\n+\n+def _to_int(value: int, /) -> int:\n+    try:\n+        return int(value)\n+    except OverflowError:\n+        raise ValueError('cannot convert to int')\n+\n+\n+def _to_float32(values: list[float], /) -> list[float]:\n+    return array('f', values).tolist()\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 43999,
+        "completion_tokens": 1352,
+        "cached_tokens": 43997,
+        "extra": {
+          "cache_write_tokens": 1334
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 9,
+      "timestamp": "2026-11-25T17:37:04.703000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01BKu2TRbVzJGTMkYEjGs6AD",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && python - <<'EOF'\np='pgvector/sparsevec.py'\ns=open(p).read()\ns=s.replace(\"\"\"        elements = [(i, v) for i, v in d.items() if v != 0]\n        elements.sort()\n\n        self._dim = _to_int(dim)\n        self._indices = [_to_int(v[0]) for v in elements]\"\"\",\"\"\"        elements = [(_to_int(i), v) for i, v in d.items() if v != 0]\n        elements.sort(key=lambda v: v[0])\n\n        self._dim = _to_int(dim)\n        self._indices = [v[0] for v in elements]\"\"\")\nopen(p,'w').write(s)\nEOF"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01BKu2TRbVzJGTMkYEjGs6AD",
+            "content": "(no output)"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 45333,
+        "completion_tokens": 602,
+        "cached_tokens": 45331,
+        "extra": {
+          "cache_write_tokens": 2840
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 10,
+      "timestamp": "2026-11-25T17:37:12.171000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "Now Bit.",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01Am97oDZGwrfKfNWhuqLfdc",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && python - <<'EOF'\np='pgvector/bit.py'\ns=open(p).read()\ns=s.replace(\"from ._utils import is_ndarray\",\"from ._utils import INT32_MAX, is_ndarray\")\ns=s.replace(\"\"\"        else:\n            raise ValueError('expected bytes, str, list, or ndarray')\n\"\"\",\"\"\"        else:\n            raise ValueError('expected bytes, str, list, or ndarray')\n\n        if self._length > INT32_MAX:\n            raise ValueError('bit string too long')\n\"\"\")\ns=s.replace(\"\"\"        bit = cls.__new__(cls)\n        bit._length = length\n        bit._data = data\"\"\",\"\"\"        # clear padding bits like Postgres\n        padding = 8 * len(data) - length\n        if padding > 0:\n            data = data[:-1] + bytes([data[-1] & (0xff << padding) & 0xff])\n\n        bit = cls.__new__(cls)\n        bit._length = length\n        bit._data = data\"\"\")\nopen(p,'w').write(s)\nEOF\npython -m pytest tests/test_vector.py tests/test_half_vector.py tests/test_sparse_vector.py tests/test_bit.py -q 2>&1 | tail -5"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01Am97oDZGwrfKfNWhuqLfdc",
+            "content": "........................................................................ [ 59%]\n..................................................                       [100%]\n122 passed in 0.22s\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 48173,
+        "completion_tokens": 576,
+        "cached_tokens": 48171,
+        "extra": {
+          "cache_write_tokens": 611
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 11,
+      "timestamp": "2026-11-25T17:37:22.164000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "Let me fuzz round-trips across edge cases.",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_012fwLShuK3L9Bipnpc9Uruk",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && cat > /tmp/opencode/fuzz.py <<'EOF'\nimport math, random, struct\nimport numpy as np\nfrom scipy import sparse\nfrom pgvector import Vector, HalfVector, SparseVector, Bit\n\ndef check(v):\n    t = type(v)\n    a = t.from_text(v.to_text()); b = t.from_binary(v.to_binary())\n    assert a == v and b == v, (v, a, b)\n    assert a.to_text() == v.to_text() and b.to_binary() == v.to_binary(), v\n    assert a.to_binary() == v.to_binary() and b.to_text() == v.to_text(), v\n\ndef tryc(f):\n    try: v = f()\n    except ValueError: return\n    check(v)\n\nspecials = [0.0, -0.0, 1e-50, -1e-50, 1e-45, 1e-40, 1e-8, 0.1, 1/3, 65504, 65519, 65520, 1e5, 1e10, 3.4028235e38, 3.5e38, 1e40, 1e308, math.inf, -math.inf, math.nan, 10**400, True, 2**64]\nfor x in specials:\n    for cls in (Vector, HalfVector):\n        tryc(lambda: cls([x, 1]))\n        tryc(lambda: cls(np.array([x, 1.0]) if not isinstance(x, int) or abs(x) < 1e300 else np.array([1.0])))\n        tryc(lambda: cls.from_text(f'[{x}]'))\n    tryc(lambda: SparseVector([x, 0, 1]))\n    tryc(lambda: SparseVector(np.array([float(x), 0, 1]) if abs(float(x) if not isinstance(x,int) or x < 1e300 else 0) >= 0 else None))\n    tryc(lambda: SparseVector({0: x, 2: 1}, 3))\n    tryc(lambda: SparseVector({x: 1}, 3))\n    tryc(lambda: SparseVector({0: 1}, x))\n    tryc(lambda: SparseVector.from_text(f'{{1:{x}}}/3'))\n    tryc(lambda: SparseVector(sparse.coo_array(np.array([float(x) if not isinstance(x,int) or x<1e300 else 1.0, 0, 1]))))\nfor d in (2**31 - 1, 2**31, -2**31, -2**31 - 1, -5):\n    tryc(lambda: SparseVector({0: 1}, d))\n    tryc(lambda: SparseVector({d: 1}, 3))\n    tryc(lambda: SparseVector.from_text(f'{{{d}:1}}/{d}'))\nfor n in (32767, 32768, 65535, [REDACTED]):\n    for cls in (Vector, HalfVector):\n        tryc(lambda: cls([1.0] * n))\nfor bits in [struct.pack('>f', math.nan), struct.pack('>f', math.inf), b'\\x7f\\xc0\\x00\\x01', b'\\xff\\xc0\\x00\\x00']:\n    tryc(lambda: Vector.from_binary(struct.pack('>HH', 1, 0) + bits))\n    tryc(lambda: HalfVector.from_binary(struct.pack('>HH', 2, 0) + bits))\n    tryc(lambda: SparseVector.from_binary(struct.pack('>iii', 3, 1, 0) + struct.pack('>i', 0) + bits))\nfor _ in range(20000):\n    k = random.randint(0, 16)\n    raw = bytes(random.getrandbits(8) for _ in range(k))\n    for cls, size in ((Vector, 4), (HalfVector, 2)):\n        tryc(lambda: cls.from_binary(struct.pack('>HH', k // size, 0) + raw[:k // size * size]))\n    n = random.randint(0, 20)\n    tryc(lambda: Bit.from_binary(struct.pack('>i', n) + bytes(random.getrandbits(8) for _ in range((n + 7) // 8))))\n    tryc(lambda: Bit(raw))\n    tryc(lambda: Bit(''.join(random.choice('01') for _ in range(n))))\n    vals = [random.choice([0.0, random.uniform(-1e6, 1e6), random.choice(specials[:-5])]) for _ in range(n)]\n    tryc(lambda: SparseVector(vals))\n    tryc(lambda: Vector(vals)); tryc(lambda: HalfVector(vals))\n    nnz = random.randint(0, 3)\n    tryc(lambda: SparseVector.from_binary(struct.pack(f'>iii{nnz}i', random.randint(-5, 5), nnz, 0, *[random.randint(-5, 5) for _ in range(nnz)]) + bytes(random.getrandbits(8) for _ in range(4 * nnz))))\nprint('ok')\nEOF\npython -W ignore /tmp/opencode/fuzz.py"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_012fwLShuK3L9Bipnpc9Uruk",
+            "content": "Traceback (most recent call last):\n  File \"/tmp/opencode/fuzz.py\", line 4, in <module>\n    from pgvector import Vector, HalfVector, SparseVector, Bit\nModuleNotFoundError: No module named 'pgvector'\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 48784,
+        "completion_tokens": 1794,
+        "cached_tokens": 48782,
+        "extra": {
+          "cache_write_tokens": 616
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 12,
+      "timestamp": "2026-11-25T17:37:34.846000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01A5TuNdYfrszo1Q5ebEECpE",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && PYTHONPATH=/app python -W ignore /tmp/opencode/fuzz.py"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01A5TuNdYfrszo1Q5ebEECpE",
+            "content": "Traceback (most recent call last):\n  File \"/tmp/opencode/fuzz.py\", line 25, in <module>\n    tryc(lambda: SparseVector(np.array([float(x), 0, 1]) if abs(float(x) if not isinstance(x,int) or x < 1e300 else 0) >= 0 else None))\n  File \"/tmp/opencode/fuzz.py\", line 14, in tryc\n    try: v = f()\n             ^^^\n  File \"/tmp/opencode/fuzz.py\", line 25, in <lambda>\n    tryc(lambda: SparseVector(np.array([float(x), 0, 1]) if abs(float(x) if not isinstance(x,int) or x < 1e300 else 0) >= 0 else None))\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/app/pgvector/sparsevec.py\", line 50, in __init__\n    self._from_dense(value)  # type: ignore\n    ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/app/pgvector/sparsevec.py\", line 144, in _from_dense\n    self._dim = len(value)\n                ^^^^^^^^^^\nTypeError: object of type 'NoneType' has no len()\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 49400,
+        "completion_tokens": 82,
+        "cached_tokens": 49398,
+        "extra": {
+          "cache_write_tokens": 1888
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 13,
+      "timestamp": "2026-11-25T17:37:41.750000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01AtgvEEcbfLddNKPQKu69EK",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && python - <<'EOF'\np='/tmp/opencode/fuzz.py'\ns=open(p).read()\ns=s.replace(\"tryc(lambda: SparseVector(np.array([float(x), 0, 1]) if abs(float(x) if not isinstance(x,int) or x < 1e300 else 0) >= 0 else None))\",\"tryc(lambda: SparseVector(np.array([fx(x), 0, 1])))\")\ns=s.replace(\"np.array([x, 1.0]) if not isinstance(x, int) or abs(x) < 1e300 else np.array([1.0])\",\"np.array([fx(x), 1.0])\")\ns=s.replace(\"float(x) if not isinstance(x,int) or x<1e300 else 1.0\",\"fx(x)\")\ns=s.replace(\"def check\",\"def fx(x):\\n    try: return float(x)\\n    except OverflowError: return 1.0\\n\\ndef check\")\nopen(p,'w').write(s)\nEOF\nPYTHONPATH=/app python -W ignore /tmp/opencode/fuzz.py"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01AtgvEEcbfLddNKPQKu69EK",
+            "content": "Traceback (most recent call last):\n  File \"/tmp/opencode/fuzz.py\", line 28, in <module>\n    tryc(lambda: SparseVector([x, 0, 1]))\n  File \"/tmp/opencode/fuzz.py\", line 18, in tryc\n    try: v = f()\n             ^^^\n  File \"/tmp/opencode/fuzz.py\", line 28, in <lambda>\n    tryc(lambda: SparseVector([x, 0, 1]))\n                 ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/app/pgvector/sparsevec.py\", line 50, in __init__\n    self._from_dense(value)  # type: ignore\n    ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/app/pgvector/sparsevec.py\", line 148, in _from_dense\n    v = float(v)\n        ^^^^^^^^\nOverflowError: int too large to convert to float\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 51288,
+        "completion_tokens": 429,
+        "cached_tokens": 51286,
+        "extra": {
+          "cache_write_tokens": 606
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 14,
+      "timestamp": "2026-11-25T17:37:49.827000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01APCqk62PKGnhaa7osYJZsP",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && python - <<'EOF'\np='pgvector/sparsevec.py'\ns=open(p).read()\ns=s.replace(\"\"\"            v = float(v)\n            if v != 0:\"\"\",\"\"\"            v = _to_float(v)\n            if v != 0:\"\"\")\ns=s.replace(\"\"\"        self._values = [float(v[1]) for v in elements]\n        self._round_values()\n        # TODO\"\"\",\"\"\"        self._values = [_to_float(v[1]) for v in elements]\n        self._round_values()\n        # TODO\"\"\")\ns=s.replace(\"\"\"def _to_float32(\"\"\",\"\"\"def _to_float(value: float, /) -> float:\n    try:\n        return float(value)\n    except OverflowError:\n        raise ValueError('value out of range for sparsevec')\n\n\ndef _to_float32(\"\"\")\ns=s.replace(\"raise ValueError('cannot convert to int')\",\"raise ValueError('cannot convert float infinity to integer')\")\nopen(p,'w').write(s)\nEOF\nPYTHONPATH=/app python -W ignore /tmp/opencode/fuzz.py"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01APCqk62PKGnhaa7osYJZsP",
+            "content": "ok\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 51894,
+        "completion_tokens": 445,
+        "cached_tokens": 51892,
+        "extra": {
+          "cache_write_tokens": 759
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 15,
+      "timestamp": "2026-11-25T17:37:58.356000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "Sanity check: the fuzz should fail on the original code.",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01AuQ4NX5HCD8y5XgLS9Wb76",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && git stash -q && PYTHONPATH=/app python -W ignore /tmp/opencode/fuzz.py 2>&1 | tail -2; git stash pop -q && git status --short"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01AuQ4NX5HCD8y5XgLS9Wb76",
+            "content": "           ^^^^^^^^^^^^^^^^^\nAssertionError: (SparseVector({0: 1e-50, 2: 1.0}, 3), SparseVector({0: 1e-50, 2: 1.0}, 3), SparseVector({0: 0.0, 2: 1.0}, 3))\n M pgvector/_utils.py\n M pgvector/bit.py\n M pgvector/halfvec.py\n M pgvector/sparsevec.py\n M pgvector/vector.py\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 52653,
+        "completion_tokens": 162,
+        "cached_tokens": 52651,
+        "extra": {
+          "cache_write_tokens": 453
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 16,
+      "timestamp": "2026-11-25T17:38:04.995000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01Pdh48ysSdED2QPq4E4W6fd",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && grep -rn \"_from_parts\\|\\._values\\|\\._indices\\|\\._value\\b\\|__new__\" pgvector --include=*.py | grep -v \"pgvector/\\(vector\\|halfvec\\|sparsevec\\|bit\\).py\"; git diff pgvector/bit.py pgvector/vector.py"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01Pdh48ysSdED2QPq4E4W6fd",
+            "content": "pgvector/psycopg2/vector.py:12:        self._value = value\npgvector/psycopg2/vector.py:15:        return adapt(self._value.to_text()).getquoted()\npgvector/psycopg2/sparsevec.py:8:        self._value = value\npgvector/psycopg2/sparsevec.py:11:        return adapt(self._value.to_text()).getquoted()\npgvector/psycopg2/halfvec.py:8:        self._value = value\npgvector/psycopg2/halfvec.py:11:        return adapt(self._value.to_text()).getquoted()\ndiff --git a/pgvector/bit.py b/pgvector/bit.py\nindex a9370e4..be41d62 100644\n--- a/pgvector/bit.py\n+++ b/pgvector/bit.py\n@@ -1,7 +1,7 @@\n from __future__ import annotations\n from struct import pack, unpack_from\n from typing import TYPE_CHECKING\n-from ._utils import is_ndarray\n+from ._utils import INT32_MAX, is_ndarray\n \n if TYPE_CHECKING:\n     import numpy as np\n@@ -55,6 +55,9 @@ class Bit:\n         else:\n             raise ValueError('expected bytes, str, list, or ndarray')\n \n+        if self._length > INT32_MAX:\n+            raise ValueError('bit string too long')\n+\n     def __repr__(self) -> str:\n         return f'Bit({self.to_text()})'\n \n@@ -91,6 +94,11 @@ class Bit:\n         if length < 0 or len(data) != (length + 7) // 8:\n             raise ValueError('invalid length')\n \n+        # clear padding bits like Postgres\n+        padding = 8 * len(data) - length\n+        if padding > 0:\n+            data = data[:-1] + bytes([data[-1] & (0xff << padding) & 0xff])\n+\n         bit = cls.__new__(cls)\n         bit._length = length\n         bit._data = data\ndiff --git a/pgvector/vector.py b/pgvector/vector.py\nindex d86cba0..8d22559 100644\n--- a/pgvector/vector.py\n+++ b/pgvector/vector.py\n@@ -3,7 +3,7 @@ from array import array\n import struct\n import sys\n from typing import TYPE_CHECKING\n-from ._utils import is_ndarray, ndarray\n+from ._utils import MAX_VECTOR_DIM, has_nan, is_ndarray, ndarray\n \n if TYPE_CHECKING:\n     import numpy as np\n@@ -18,6 +18,8 @@ class Vector:\n                 self._value = array('f', value)\n             except TypeError:\n                 raise ValueError('expected list[float]')\n+            except OverflowError:\n+                raise ValueError('value out of range for vector')\n         elif is_ndarray(value):\n             import numpy as np\n \n@@ -30,6 +32,15 @@ class Vector:\n         else:\n             raise ValueError('expected list or ndarray')\n \n+        self._validate()\n+\n+    def _validate(self) -> None:\n+        if len(self._value) > MAX_VECTOR_DIM:\n+            raise ValueError(f'vector cannot have more than {MAX_VECTOR_DIM} dimensions')\n+\n+        if has_nan(self._value):\n+            raise ValueError('NaN not allowed in vector')\n+\n     def __repr__(self) -> str:\n         return f'Vector({self.to_list()})'\n \n@@ -66,7 +77,7 @@ class Vector:\n \n     @classmethod\n     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> Vector:\n-        dim, unused = struct.unpack_from('>hh', value)\n+        dim, unused = struct.unpack_from('>HH', value)\n         data = memoryview(value)[4:]\n \n         if len(data) != 4 * dim:\n@@ -82,6 +93,7 @@ class Vector:\n \n         vec = cls.__new__(cls)\n         vec._value = arr\n+        vec._validate()\n         return vec\n \n     @classmethod\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 53106,
+        "completion_tokens": 248,
+        "cached_tokens": 53104,
+        "extra": {
+          "cache_write_tokens": 338
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 17,
+      "timestamp": "2026-11-25T17:38:13.471000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "Now add tests.",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01CmAZBPpH2K5VGvXULJYpM6",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && cat >> tests/test_vector.py <<'EOF'\n\n    def test_round_trip_nan(self) -> None:\n        with pytest.raises(ValueError, match='NaN not allowed in vector'):\n            Vector([float('nan')])\n        with pytest.raises(ValueError, match='NaN not allowed in vector'):\n            Vector.from_text('[nan]')\n        with pytest.raises(ValueError, match='NaN not allowed in vector'):\n            Vector.from_binary(struct.pack('>hhf', 1, 0, float('nan')))\n\n    def test_round_trip_nan_ndarray(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        with pytest.raises(ValueError, match='NaN not allowed in vector'):\n            Vector(np.array([np.nan]))\n\n    def test_init_list_overflow(self) -> None:\n        with pytest.raises(ValueError, match='value out of range for vector'):\n            Vector([10**400])\n\n    def test_round_trip_max_dimensions(self) -> None:\n        vec = Vector([1] * 65535)\n        assert Vector.from_binary(vec.to_binary()) == vec\n        assert Vector.from_text(vec.to_text()) == vec\n\n    def test_init_too_many_dimensions(self) -> None:\n        with pytest.raises(ValueError, match='vector cannot have more than 65535 dimensions'):\n            Vector([1] * [REDACTED])\nEOF\ncat >> tests/test_half_vector.py <<'EOF'\n\n    def test_round_trip_nan(self) -> None:\n        with pytest.raises(ValueError, match='NaN not allowed in halfvec'):\n            HalfVector([float('nan')])\n        with pytest.raises(ValueError, match='NaN not allowed in halfvec'):\n            HalfVector.from_text('[nan]')\n        with pytest.raises(ValueError, match='NaN not allowed in halfvec'):\n            HalfVector.from_binary(struct.pack('>hhe', 1, 0, float('nan')))\n\n    def test_round_trip_nan_ndarray(self) -> None:\n        if np is None:\n            pytest.skip('NumPy required')\n\n        with pytest.raises(ValueError, match='NaN not allowed in halfvec'):\n            HalfVector(np.array([np.nan]))\n\n    def test_init_list_overflow(self) -> None:\n        with pytest.raises(ValueError, match='value out of range for halfvec'):\n            HalfVector([1e10])\n        with pytest.raises(ValueError, match='value out of range for halfvec'):\n            HalfVector.from_text('[1e10]')\n\n    def test_round_trip_max_dimensions(self) -> None:\n        vec = HalfVector([1] * 65535)\n        assert HalfVector.from_binary(vec.to_binary()) == vec\n        assert HalfVector.from_text(vec.to_text()) == vec\n\n    def test_init_too_many_dimensions(self) -> None:\n        with pytest.raises(ValueError, match='halfvec cannot have more than 65535 dimensions'):\n            HalfVector([1] * [REDACTED])\nEOF\ncat >> tests/test_sparse_vector.py <<'EOF'\n\n    def assert_round_trip(self, vec: SparseVector) -> None:\n        assert SparseVector.from_text(vec.to_text()) == vec\n        assert SparseVector.from_binary(vec.to_binary()) == vec\n\n    def test_round_trip_float32(self) -> None:\n        vec = SparseVector([0.1, 0, 1e40])\n        assert vec.values() == [struct.unpack('f', struct.pack('f', 0.1))[0], float('inf')]\n        self.assert_round_trip(vec)\n        self.assert_round_trip(SparseVector({0: 0.1}, 1))\n        self.assert_round_trip(SparseVector.from_text('{1:0.1}/1'))\n\n    def test_round_trip_underflow(self) -> None:\n        vec = SparseVector({0: 1e-50, 1: 1}, 2)\n        assert vec.indices() == [1]\n        self.assert_round_trip(vec)\n        self.assert_round_trip(SparseVector([1e-50, 1]))\n\n    def test_round_trip_nan(self) -> None:\n        with pytest.raises(ValueError, match='NaN not allowed in sparsevec'):\n            SparseVector([float('nan')])\n        with pytest.raises(ValueError, match='NaN not allowed in sparsevec'):\n            SparseVector({0: float('nan')}, 1)\n        with pytest.raises(ValueError, match='NaN not allowed in sparsevec'):\n            SparseVector.from_text('{1:nan}/1')\n        with pytest.raises(ValueError, match='NaN not allowed in sparsevec'):\n            SparseVector.from_binary(struct.pack('>iiiif', 1, 1, 0, 0, float('nan')))\n\n    def test_init_value_overflow(self) -> None:\n        with pytest.raises(ValueError, match='value out of range for sparsevec'):\n            SparseVector([10**400])\n\n    def test_dimensions_out_of_range(self) -> None:\n        self.assert_round_trip(SparseVector({0: 1}, 2**31 - 1))\n        with pytest.raises(ValueError, match='sparsevec dimensions out of range'):\n            SparseVector({0: 1}, 2**31)\n        with pytest.raises(ValueError, match='sparsevec dimensions out of range'):\n            SparseVector.from_text('{1:1}/2147483648')\n\n    def test_index_out_of_range(self) -> None:\n        with pytest.raises(ValueError, match='sparsevec index out of range'):\n            SparseVector({2**31: 1}, 3)\n        with pytest.raises(ValueError, match='sparsevec index out of range'):\n            SparseVector.from_text('{2147483649:1}/3')\n        with pytest.raises(ValueError):\n            SparseVector({float('inf'): 1}, 3)\nEOF\ncat >> tests/test_bit.py <<'EOF'\n\n    def test_from_binary_padding(self) -> None:\n        bit = Bit.from_binary(struct.pack('>iB', 3, 0xff))\n        assert bit == Bit('111')\n        assert bit.to_binary() == struct.pack('>iB', 3, 0xe0)\n        assert Bit.from_text(bit.to_text()) == bit\nEOF\npython -m pytest tests/test_vector.py tests/test_half_vector.py tests/test_sparse_vector.py tests/test_bit.py -q 2>&1 | tail -3; make lint; python -m mypy pgvector 2>&1 | tail -2"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01CmAZBPpH2K5VGvXULJYpM6",
+            "content": "........................................................................ [ 51%]\n...................................................................      [100%]\n139 passed in 0.31s\npycodestyle . --ignore=E501,E704,W504 --exclude=.venv\nmake: pycodestyle: No such file or directory\nmake: *** [Makefile:4: lint] Error 127\n/usr/bin/python: No module named mypy\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 53444,
+        "completion_tokens": 2432,
+        "cached_tokens": 53442,
+        "extra": {
+          "cache_write_tokens": 1668
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 18,
+      "timestamp": "2026-11-25T17:38:31.151000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01Gp6KxLV8us6kDhE98Gnh5j",
+          "function_name": "bash",
+          "arguments": {
+            "command": "cd /app && timeout 100 python -m pytest -q -x 2>&1 | tail -3; python -c \"\nimport sys; sys.modules['numpy']=None; sys.modules['scipy']=None\nsys.path.insert(0,'.')\nfrom pgvector import *; print(SparseVector([0.1,0]).to_binary(), Vector([1]).to_text(), HalfVector([1]).to_text())\""
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01Gp6KxLV8us6kDhE98Gnh5j",
+            "content": "........................................................................ [ 96%]\n......................                                                   [100%]\n598 passed in 7.03s\nb'\\x00\\x00\\x00\\x02\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00=\\xcc\\xcc\\xcd' [1.0] [1.0]\n"
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 55112,
+        "completion_tokens": 236,
+        "cached_tokens": 55110,
+        "extra": {
+          "cache_write_tokens": 2554
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 19,
+      "timestamp": "2026-11-25T17:38:45.726000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "All 598 tests pass, DB tests included. I'll add changelog entries.",
+      "tool_calls": [
+        {
+          "tool_call_id": "toolu_01U5dYeL1bJptraWVpQ18Hxh",
+          "function_name": "edit",
+          "arguments": {
+            "filePath": "/app/CHANGELOG.md",
+            "oldString": "- Fixed equality for `HalfVector` with signed zeros\n",
+            "newString": "- Fixed equality for `HalfVector` with signed zeros\n- Fixed `SparseVector` values not round-tripping between text and binary formats (values are now stored as float32)\n- Fixed `from_binary` for `Vector` and `HalfVector` with more than 32767 dimensions\n- Fixed `Bit.from_binary` with non-zero padding bits\n- Changed `Vector`, `HalfVector`, and `SparseVector` to raise `ValueError` for NaN, out-of-range values, and dimensions or indices that cannot be encoded\n"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "toolu_01U5dYeL1bJptraWVpQ18Hxh",
+            "content": "Edit applied successfully."
+          }
+        ]
+      },
+      "metrics": {
+        "prompt_tokens": 57666,
+        "completion_tokens": 364,
+        "cached_tokens": 57664,
+        "extra": {
+          "cache_write_tokens": 351
+        }
+      },
+      "llm_call_count": 1
+    },
+    {
+      "step_id": 20,
+      "timestamp": "2026-11-25T17:38:56.457000+00:00",
+      "source": "agent",
+      "model_name": "anthropic/shrike",
+      "message": "I found the values that didn't round-trip exactly and fixed each one. The full suite passes (598 tests, including the database tests), and I added tests for every case without changing existing ones. A separate fuzz script that round-trips edge cases through both formats passes now and fails on the original code. `make lint` (pycodestyle) and mypy couldn't run because neither is installed here.\n\n**Made to round-trip:**\n- **`SparseVector`: decimal precision.** The text format kept full double precision but the binary format stores float32, so values like `0.1` came back changed from `from_binary`. All constructors and `from_text` now store values as float32, which is also what Postgres stores. As a result, `values()` returns float32-rounded numbers.\n- **`SparseVector`: values that round to zero.** Values like `1e-50` become zero in binary, so they are now dropped from the vector, as other zeros are.\n- **`Vector`/`HalfVector`: 32,768\u201365,535 dimensions.** `to_binary` wrote the dimension count as unsigned but `from_binary` read it as signed, so these sizes failed. `from_binary` now reads it as unsigned. This undoes the planned switch to signed in the \"change to >hh in 0.6.0\" TODO, which assumed the reader was signed.\n- **`Bit.from_binary`: non-zero padding bits.** These were kept in the binary data but lost in text. They're now cleared, as Postgres does.\n\n**Now rejected with `ValueError`:**\n- NaN in `Vector`, `HalfVector` and `SparseVector`, from every input path including binary. NaN never compares equal, so these values could never come back \"the same\".\n- `Vector`/`HalfVector` with more than 65,535 dimensions, which the binary format can't encode.\n- `SparseVector` dimensions or indices outside the 32-bit integer range.\n- `Bit` longer than 2\u00b3\u00b9\u22121 bits.\n- Numbers too large to convert (e.g. `10**400`, or `1e10` for `HalfVector`). These used to raise `OverflowError` instead of `ValueError`.\n\n**Decision for you:** infinity, and float32 overflow turning into infinity (e.g. `Vector([1e40])`), are still accepted. They round-trip today, so rejecting them would break values that work now, even though Postgres itself refuses them. If you'd rather match Postgres here, it's a small change.\n\nThe fixes are in `pgvector/vector.py`, `halfvec.py`, `sparsevec.py` and `bit.py`, with shared helpers in `_utils.py`. NumPy and SciPy are still optional, and I added entries to `CHANGELOG.md`.",
+      "metrics": {
+        "prompt_tokens": 58017,
+        "completion_tokens": 925,
+        "cached_tokens": 58015,
+        "extra": {
+          "cache_write_tokens": 378
+        }
+      },
+      "llm_call_count": 1
+    }
+  ],
+  "final_metrics": {
+    "total_prompt_tokens": 828251,
+    "total_completion_tokens": 26075,
+    "total_cached_tokens": 828211,
+    "total_steps": 20
+  }
+}
