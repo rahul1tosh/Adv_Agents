@@ -1,323 +1,482 @@
-diff --git a/pgvector/_utils.py b/pgvector/_utils.py
-index 4cafc32..19a83c9 100644
---- a/pgvector/_utils.py
-+++ b/pgvector/_utils.py
-@@ -1,3 +1,5 @@
-+import math
-+import struct
- import sys
- from typing import TYPE_CHECKING, TypeAlias
+diff --git a/pgvector/sparsevec.py b/pgvector/sparsevec.py
+index 76e1356..c81f7e4 100644
+--- a/pgvector/sparsevec.py
++++ b/pgvector/sparsevec.py
+@@ -1,4 +1,6 @@
+ from __future__ import annotations
++from math import ldexp
++import re
+ from struct import pack, unpack_from
+ from typing import TYPE_CHECKING, Final, cast, overload
+ from ._utils import is_sparse_array, ndarray
+@@ -13,6 +15,121 @@ class Sentinel:
  
-@@ -10,6 +12,10 @@ else:
-     # TODO use Never when Python 3.10 no longer supported
-     ndarray = None
  
-+_F32_OVF_THRESHOLD = (2.0 - 2.0**-24) * 2.0**127
-+_F32_MIN_MIDPOINT = 2.0**-150
-+_F32_MIN_NORMAL = 2.0**-126
+ NO_DEFAULT: Final[Sentinel] = Sentinel()
++_WS_RE: Final[re.Pattern[str]] = re.compile(r'[ \t\n\r\v\f]*')
++_INT_RE: Final[re.Pattern[str]] = re.compile(r'[+-]?[0-9]+')
++_VALUE_RE: Final[re.Pattern[str]] = re.compile(
++    r'([+-]?)(?:'
++    r'(?:([0-9]+)(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?'
++    r'|([Ii][Nn][Ff](?:[Ii][Nn][Ii][Tt][Yy])?)'
++    r'|([Nn][Aa][Nn])'
++    r')'
++)
 +
- 
- def is_ndarray(value: object, /) -> bool:
-     if (numpy := sys.modules.get('numpy')):
-@@ -21,3 +27,136 @@ def is_sparse_array(value: object, /) -> bool:
-     if (sparse := sys.modules.get('scipy.sparse')):
-         return isinstance(value, (sparse.sparray, sparse.spmatrix))
-     return False
++
++def _parse_clamped_int(s: str, min_val: int, max_val: int, max_digits: int) -> int:
++    neg = False
++    has_sign = False
++    if s[0] == '-':
++        neg = True
++        has_sign = True
++    elif s[0] == '+':
++        has_sign = True
++    nz = (s[1:] if has_sign else s).lstrip('0')
++    if not nz:
++        return 0
++    if len(nz) > max_digits:
++        return min_val if neg else max_val
++    val = -int(nz) if neg else int(nz)
++    if val < min_val:
++        return min_val
++    if val > max_val:
++        return max_val
++    return val
 +
 +
-+def _cmp_abs_decimal_to_float(v: str, target: float, /) -> int:
-+    s = v.strip().replace('_', '')
-+    if s[0] in '+-':
-+        s = s[1:]
-+    idx = s.find('e')
-+    if idx == -1:
-+        idx = s.find('E')
-+    if idx != -1:
-+        mant_str = s[:idx]
-+        exp_str = s[idx + 1:]
-+        exp_neg = exp_str[0] == '-'
-+        exp_digits = exp_str[1:] if exp_str[0] in '+-' else exp_str
-+        i = 0
-+        n_exp = len(exp_digits)
-+        while i < n_exp and int(exp_digits[i]) == 0:
-+            i += 1
-+        exp_digits = exp_digits[i:]
-+        if not exp_digits:
-+            exp10 = 0
-+        elif len(exp_digits) > 18:
-+            return -1 if exp_neg else 1
-+        else:
-+            exp10 = -int(exp_digits) if exp_neg else int(exp_digits)
++def _round_decimal_to_f32(neg: bool, int_digits: str, frac_digits: str, exp_val: int) -> float | None:
++    int_nz = int_digits.lstrip('0')
++    frac_nz_right = frac_digits.rstrip('0')
++    if not int_nz and not frac_nz_right:
++        return 0.0
++
++    frac_trimmed = ''
++    if int_nz:
++        first_digit_exp = len(int_nz) - 1 + exp_val
 +    else:
-+        mant_str = s
-+        exp10 = 0
++        frac_trimmed = frac_nz_right.lstrip('0')
++        lz = len(frac_nz_right) - len(frac_trimmed)
++        first_digit_exp = -(lz + 1) + exp_val
 +
-+    dot = mant_str.find('.')
-+    if dot != -1:
-+        int_part = mant_str[:dot]
-+        frac_part = mant_str[dot + 1:]
++    if first_digit_exp >= 39 or first_digit_exp <= -47:
++        return None
++
++    need = first_digit_exp + 151
++    if int_nz:
++        if len(int_nz) >= need:
++            digits = int_nz[:need]
++            scale_exp = -150
++            sticky = bool(int_nz[need:].lstrip('0')) or bool(frac_nz_right)
++        else:
++            rem = need - len(int_nz)
++            if len(frac_nz_right) <= rem:
++                digits = int_nz + frac_nz_right
++                scale_exp = first_digit_exp - (len(digits) - 1)
++                sticky = False
++            else:
++                digits = int_nz + frac_nz_right[:rem]
++                scale_exp = -150
++                sticky = True
 +    else:
-+        int_part = mant_str
-+        frac_part = ''
-+
-+    kept: list[str] = []
-+    sticky = False
-+    started = False
-+    for ch in int_part:
-+        d = ord(ch) - 48
-+        if not 0 <= d <= 9:
-+            d = int(ch)
-+        if not started:
-+            if d == 0:
-+                continue
-+            started = True
-+        if len(kept) < 200:
-+            kept.append(chr(48 + d))
++        if len(frac_trimmed) <= need:
++            digits = frac_trimmed
++            scale_exp = first_digit_exp - (len(digits) - 1)
++            sticky = False
 +        else:
-+            exp10 += 1
-+            if d != 0:
-+                sticky = True
-+    for ch in frac_part:
-+        d = ord(ch) - 48
-+        if not 0 <= d <= 9:
-+            d = int(ch)
-+        if not started:
-+            if d == 0:
-+                exp10 -= 1
-+                continue
-+            started = True
-+        if len(kept) < 200:
-+            kept.append(chr(48 + d))
-+            exp10 -= 1
-+        else:
-+            if d != 0:
-+                sticky = True
++            digits = frac_trimmed[:need]
++            scale_exp = -150
++            sticky = True
 +
-+    if not kept:
-+        return -1
-+    digits = int(''.join(kept))
 +    if sticky:
-+        digits = digits * 10 + 1
-+        exp10 -= 1
-+    if exp10 > 40:
-+        return 1
-+    if exp10 < -300:
-+        return -1
-+    num, den = target.as_integer_ratio()
-+    if exp10 >= 0:
-+        lhs = digits * (10**exp10) * den
-+        rhs = num
++        digits += '1'
++        scale_exp -= 1
++
++    num = int(digits)
++    if scale_exp >= 0:
++        n_val = num * (10 ** scale_exp)
++        d_val = 1
 +    else:
-+        lhs = digits * den
-+        rhs = num * (10**-exp10)
-+    return (lhs > rhs) - (lhs < rhs)
++        n_val = num
++        d_val = 10 ** (-scale_exp)
 +
-+
-+def _str_to_float32(v: str, type_name: str, /) -> tuple[float, bool]:
-+    f = float(v)
-+    if math.isnan(f):
-+        return f, True
-+    if math.isinf(f):
-+        token = v.strip()
-+        body = token[1:] if token[0] in '+-' else token
-+        if body.lower() in ('inf', 'infinity'):
-+            return f, True
-+        raise ValueError(f'"{token}" is out of range for type {type_name}')
-+    af = abs(f)
-+    if af > _F32_OVF_THRESHOLD:
-+        raise ValueError(f'"{v.strip()}" is out of range for type {type_name}')
-+    if af < _F32_MIN_MIDPOINT:
-+        return math.copysign(0.0, f), False
-+
-+    bits = int(struct.unpack('Q', struct.pack('d', af))[0])
-+    exp64 = (bits >> 52) - 1023
-+    if af >= _F32_MIN_NORMAL:
-+        is_mid = (bits & 0x1FFFFFFF) == 0x10000000
-+        h = math.ldexp(1.0, exp64 - 24)
++    e = n_val.bit_length() - d_val.bit_length()
++    if e >= 0:
++        if n_val < (d_val << e):
++            e -= 1
 +    else:
-+        shift = 52 - (exp64 + 150)
-+        if shift == 52:
-+            is_mid = (bits & 0xFFFFFFFFFFFFF) == 0
++        if (n_val << (-e)) < d_val:
++            e -= 1
++
++    if e >= 128 or e < -150:
++        return None
++
++    shift = (e if e >= -126 else -126) - 23
++    if shift >= 0:
++        p_val = n_val
++        q_val = d_val << shift
++    else:
++        p_val = n_val << (-shift)
++        q_val = d_val
++
++    q, r = divmod(p_val, q_val)
++    two_r = r << 1
++    if two_r > q_val or (two_r == q_val and (q & 1)):
++        q += 1
++
++    if q == 0 or (e == 127 and q == (1 << 24)):
++        return None
++
++    return ldexp(-q if neg else q, shift)
+ 
+ 
+ class SparseVector:
+@@ -159,16 +276,128 @@ class SparseVector:
+ 
+     @classmethod
+     def from_text(cls, value: str, /) -> SparseVector:
+-        elements, dim = value.split('/', 2)
++        if value.count(',') + 1 > 16000:
++            raise ValueError('sparsevec cannot have more than 16000 non-zero elements')
++
++        n = len(value)
++        pos = 0
++        ws = _WS_RE.match(value, pos)
++        if ws is not None:
++            pos = ws.end()
++        if pos >= n or value[pos] != '{':
++            raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++        pos += 1
++
++        ws = _WS_RE.match(value, pos)
++        if ws is not None:
++            pos = ws.end()
++
++        elements: list[tuple[int, float]] = []
++        if pos < n and value[pos] == '}':
++            pos += 1
 +        else:
-+            is_mid = (bits & ((1 << (shift + 1)) - 1)) == (1 << shift)
-+        h = _F32_MIN_MIDPOINT
++            while True:
++                ws = _WS_RE.match(value, pos)
++                if ws is not None:
++                    pos = ws.end()
++                m_idx = _INT_RE.match(value, pos)
++                if m_idx is None:
++                    raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++                pos = m_idx.end()
++                idx = _parse_clamped_int(m_idx.group(0), -2147483647, 2147483647, 10)
 +
-+    if not is_mid:
-+        return float(struct.unpack('f', struct.pack('f', f))[0]), False
++                ws = _WS_RE.match(value, pos)
++                if ws is not None:
++                    pos = ws.end()
++                if pos >= n or value[pos] != ':':
++                    raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++                pos += 1
 +
-+    cmp = _cmp_abs_decimal_to_float(v, af)
-+    if cmp == 0:
-+        if af == _F32_OVF_THRESHOLD:
-+            raise ValueError(f'"{v.strip()}" is out of range for type {type_name}')
-+        return float(struct.unpack('f', struct.pack('f', f))[0]), False
-+    if cmp < 0:
-+        low = 0.0 if af == _F32_MIN_MIDPOINT else af - h
-+        return math.copysign(low, f), False
-+    if af == _F32_OVF_THRESHOLD:
-+        raise ValueError(f'"{v.strip()}" is out of range for type {type_name}')
-+    return math.copysign(af + h, f), False
-diff --git a/pgvector/halfvec.py b/pgvector/halfvec.py
-index 2b3b325..70e2769 100644
---- a/pgvector/halfvec.py
-+++ b/pgvector/halfvec.py
-@@ -3,7 +3,7 @@ from array import array
- import struct
- import sys
- from typing import TYPE_CHECKING
--from ._utils import is_ndarray, ndarray
-+from ._utils import _str_to_float32, is_ndarray, ndarray
- 
- if TYPE_CHECKING:
-     import numpy as np
-@@ -64,7 +64,15 @@ class HalfVector:
- 
-     @classmethod
-     def from_text(cls, value: str, /) -> HalfVector:
--        return cls(cls._from_text(value))
-+        if len(value) == 2:
-+            return cls([])
-+        vals: list[float] = []
-+        for v in value[1:-1].split(','):
-+            f32, is_special = _str_to_float32(v, 'halfvec')
-+            if not is_special and abs(f32) >= 65520.0:
-+                raise ValueError(f'"{v.strip()}" is out of range for type halfvec')
-+            vals.append(f32)
-+        return cls(vals)
- 
-     @classmethod
-     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> HalfVector:
-diff --git a/pgvector/vector.py b/pgvector/vector.py
-index d86cba0..6188d1c 100644
---- a/pgvector/vector.py
-+++ b/pgvector/vector.py
-@@ -3,7 +3,7 @@ from array import array
- import struct
- import sys
- from typing import TYPE_CHECKING
--from ._utils import is_ndarray, ndarray
-+from ._utils import _str_to_float32, is_ndarray, ndarray
- 
- if TYPE_CHECKING:
-     import numpy as np
-@@ -62,7 +62,9 @@ class Vector:
- 
-     @classmethod
-     def from_text(cls, value: str, /) -> Vector:
--        return cls(cls._from_text(value))
-+        if len(value) == 2:
-+            return cls([])
-+        return cls([_str_to_float32(v, 'vector')[0] for v in value[1:-1].split(',')])
- 
-     @classmethod
-     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> Vector:
-diff --git a/tests/test_half_vector.py b/tests/test_half_vector.py
-index a907c94..aac4c48 100644
---- a/tests/test_half_vector.py
-+++ b/tests/test_half_vector.py
-@@ -1,3 +1,4 @@
-+import math
- from pgvector import HalfVector
- import pytest
- import struct
-@@ -136,3 +137,38 @@ class TestHalfVector:
-     def test_from_binary_non_zero_unused(self) -> None:
-         with pytest.raises(ValueError, match='expected unused to be 0'):
-             HalfVector.from_binary(struct.pack('>hh', 0, 1))
++                ws = _WS_RE.match(value, pos)
++                if ws is not None:
++                    pos = ws.end()
++                m_val = _VALUE_RE.match(value, pos)
++                if m_val is None:
++                    raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++                pos = m_val.end()
++                token = m_val.group(0)
 +
-+    def test_from_text_out_of_range(self) -> None:
-+        for token in ['65519.999', '-65519.999', '65520', '1e39', '-1e39', '1e1000']:
++                if m_val.group(7) is not None:
++                    raise ValueError('NaN not allowed in sparsevec')
++                if m_val.group(6) is not None:
++                    raise ValueError('infinite value not allowed in sparsevec')
++
++                g1 = m_val.group(1)
++                g2 = m_val.group(2)
++                g3 = m_val.group(3)
++                g4 = m_val.group(4)
++                g5 = m_val.group(5)
++                neg = g1 == '-'
++                int_digits = g2 if isinstance(g2, str) else ''
++                frac_digits = g3 if isinstance(g3, str) else (g4 if isinstance(g4, str) else '')
++                exp_val = _parse_clamped_int(g5, -10**15, 10**15, 15) if isinstance(g5, str) else 0
++
++                fval = _round_decimal_to_f32(neg, int_digits, frac_digits, exp_val)
++                if fval is None:
++                    raise ValueError(f'"{token}" is out of range for type sparsevec')
++                if fval != 0.0:
++                    elements.append((idx - 1, fval))
++
++                ws = _WS_RE.match(value, pos)
++                if ws is not None:
++                    pos = ws.end()
++                if pos >= n:
++                    raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++                ch = value[pos]
++                if ch == ',':
++                    pos += 1
++                elif ch == '}':
++                    pos += 1
++                    break
++                else:
++                    raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++
++        ws = _WS_RE.match(value, pos)
++        if ws is not None:
++            pos = ws.end()
++        if pos >= n or value[pos] != '/':
++            raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++        pos += 1
++
++        ws = _WS_RE.match(value, pos)
++        if ws is not None:
++            pos = ws.end()
++        m_dim = _INT_RE.match(value, pos)
++        if m_dim is None:
++            raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++        pos = m_dim.end()
++        dim = _parse_clamped_int(m_dim.group(0), -2147483648, 2147483647, 10)
++
++        ws = _WS_RE.match(value, pos)
++        if ws is not None:
++            pos = ws.end()
++        if pos != n:
++            raise ValueError(f'invalid input syntax for type sparsevec: "{value}"')
++
++        if dim < 1:
++            raise ValueError('sparsevec must have at least 1 dimension')
++        if dim > 1000000000:
++            raise ValueError('sparsevec cannot have more than 1000000000 dimensions')
++
++        elements.sort(key=lambda e: e[0])
+         indices: list[int] = []
+         values: list[float] = []
+-        # split on empty string returns single element list
+-        if len(elements) > 2:
+-            for e in elements[1:-1].split(','):
+-                i, v = e.split(':', 2)
+-                indices.append(int(i) - 1)
+-                values.append(float(v))
+-        return cls._from_parts(int(dim), indices, values)
++        prev_idx = -1
++        for stored_idx, fval in elements:
++            if stored_idx < 0 or stored_idx >= dim:
++                raise ValueError('sparsevec index out of bounds')
++            if stored_idx == prev_idx:
++                raise ValueError('sparsevec indices must not contain duplicates')
++            prev_idx = stored_idx
++            indices.append(stored_idx)
++            values.append(fval)
++
++        return cls._from_parts(dim, indices, values)
+ 
+     @classmethod
+     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> SparseVector:
+diff --git a/tests/test_sparse_vector.py b/tests/test_sparse_vector.py
+index e3bb8cc..3a085bb 100644
+--- a/tests/test_sparse_vector.py
++++ b/tests/test_sparse_vector.py
+@@ -176,19 +176,201 @@ class TestSparseVector:
+         assert SparseVector.from_text('{1:1.5,3:2,5:3}/6') == SparseVector([1.5, 0, 2, 0, 3, 0])
+ 
+     def test_from_text_zero_length(self) -> None:
+-        with pytest.raises(ValueError, match='not enough values to unpack'):
++        with pytest.raises(ValueError) as error:
+             SparseVector.from_text('')
++        assert type(error.value) is ValueError
++        assert str(error.value) == 'invalid input syntax for type sparsevec: ""'
+ 
+     def test_from_text_zero_dimensions(self) -> None:
+-        assert SparseVector.from_text('{}/0') == SparseVector([])
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{}/0')
++        assert type(error.value) is ValueError
++        assert str(error.value) == 'sparsevec must have at least 1 dimension'
+ 
+     def test_from_text_non_number_index(self) -> None:
+-        with pytest.raises(ValueError, match='invalid literal for int'):
+-            assert SparseVector.from_text('{a:1}/1')
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{a:1}/1')
++        assert type(error.value) is ValueError
++        assert str(error.value) == 'invalid input syntax for type sparsevec: "{a:1}/1"'
+ 
+     def test_from_text_non_number_value(self) -> None:
+-        with pytest.raises(ValueError, match='could not convert string to float'):
+-            assert SparseVector.from_text('{1:a}/1')
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{1:a}/1')
++        assert type(error.value) is ValueError
++        assert str(error.value) == 'invalid input syntax for type sparsevec: "{1:a}/1"'
++
++    def test_from_text_examples_and_sorting(self) -> None:
++        vec = SparseVector.from_text('{3:2, 1:1.5}/6')
++        assert vec.dimensions() == 6
++        assert vec.indices() == [0, 2]
++        assert vec.values() == [1.5, 2.0]
++
++        vec_zeros = SparseVector.from_text('{1:0,9:0}/3')
++        assert vec_zeros.dimensions() == 3
++        assert vec_zeros.indices() == []
++        assert vec_zeros.values() == []
++
++        vec_empty = SparseVector.from_text(' \t\n\r\v\f{ \t\n\r\v\f} \t\n\r\v\f/ \t\n\r\v\f3 \t\n\r\v\f')
++        assert vec_empty.dimensions() == 3
++        assert vec_empty.indices() == []
++        assert vec_empty.values() == []
++
++    def test_from_text_whitespace_and_digits(self) -> None:
++        vec = SparseVector.from_text(' { +1 : +1. , 2 : .5 , 3 : -2.5e+1 , 4 : 1.e-2 } / +5 ')
++        assert vec.dimensions() == 5
++        assert vec.indices() == [0, 1, 2, 3]
++        assert vec.values() == [1.0, 0.5, -25.0, struct.unpack('>f', struct.pack('>f', 0.01))[0]]
++
++        for bad in [
++            '{\xa01:1}/2',
++            '{\u20001:1}/2',
++            '{１:1}/2',
++            '{1:１}/2',
++            '{+ 1:1}/2',
++            '{1:+ 1}/2',
++            '{1:1e+x}/3',
++            '{1:1.5x}/3',
++            '{1:1.}/3',
++            '{1:.}/3',
++            '{1:,}/3',
++            '{1:1,}/3',
++            '{,1:1}/3',
++            '{1:1}/3 extra',
++            '{1:1}/',
++            '{1:1}',
++        ]:
++            if bad == '{1:1.}/3':
++                assert SparseVector.from_text(bad).values() == [1.0]
++                continue
 +            with pytest.raises(ValueError) as error:
-+                HalfVector.from_text(f'[1, {token} ]')
++                SparseVector.from_text(bad)
 +            assert type(error.value) is ValueError
-+            assert str(error.value) == f'"{token}" is out of range for type halfvec'
++            assert str(error.value) == f'invalid input syntax for type sparsevec: "{bad}"'
 +
-+    def test_from_text_left_to_right(self) -> None:
-+        with pytest.raises(ValueError) as error:
-+            HalfVector.from_text('[65520, a]')
-+        assert type(error.value) is ValueError
-+        assert str(error.value) == '"65520" is out of range for type halfvec'
++    def test_from_text_zero_variants(self) -> None:
++        vec = SparseVector.from_text('{10:0, 20:-0, 30:+0.0, 40:-.0, 50:0., 60:0e999999999, 70:-0.000e-999999999}/2')
++        assert vec.dimensions() == 2
++        assert vec.indices() == []
++        assert vec.values() == []
 +
-+        with pytest.raises(ValueError) as error:
-+            HalfVector.from_text('[a, 65520]')
-+        assert type(error.value) is ValueError
-+        assert str(error.value) == "could not convert string to float: 'a'"
-+
-+    def test_from_text_rounding(self) -> None:
-+        assert HalfVector.from_text('[65519.99]') == HalfVector([65504.0])
-+        assert HalfVector.from_text('[65519.998]') == HalfVector([65504.0])
-+        assert HalfVector.from_text('[1.0014648]') == HalfVector([1.001953125])
-+
-+        neg_zero = HalfVector.from_text('[-1e-10, -1e-50, -0.0]')
-+        assert neg_zero.to_binary() == struct.pack('>hh3e', 3, 0, -0.0, -0.0, -0.0)
-+        assert [math.copysign(1.0, x) for x in neg_zero.to_list()] == [-1.0, -1.0, -1.0]
-+
-+    def test_from_text_special_values(self) -> None:
-+        vec = HalfVector.from_text('[nan, +nan, -NaN, inf, +inf, -inf, infinity, +Infinity, -INFINITY]').to_list()
-+        assert all(math.isnan(x) for x in vec[:3])
-+        assert vec[3:] == [float('inf'), float('inf'), float('-inf'), float('inf'), float('inf'), float('-inf')]
-+
-+    def test_from_db_unchanged(self) -> None:
-+        assert HalfVector._from_db('[1, 65520, 1e39]') == [1.0, 65520.0, 1e39]
-diff --git a/tests/test_vector.py b/tests/test_vector.py
-index 13a9cc7..5354d3f 100644
---- a/tests/test_vector.py
-+++ b/tests/test_vector.py
-@@ -1,3 +1,4 @@
-+import math
- from pgvector import Vector
- import pytest
- import struct
-@@ -136,3 +137,53 @@ class TestVector:
-     def test_from_binary_non_zero_unused(self) -> None:
-         with pytest.raises(ValueError, match='expected unused to be 0'):
-             Vector.from_binary(struct.pack('>hh', 0, 1))
-+
-+    def test_from_text_out_of_range(self) -> None:
-+        for token in ['1e39', '-1e39', '1e1000', '3.4028235677973367e+38', '340282356779733661637539395458142568448']:
++    def test_from_text_nan_and_inf(self) -> None:
++        for s in ['{1:nan}/3', '{1:+NaN}/3', '{1:-nAn}/3', '{1:nana}/3']:
 +            with pytest.raises(ValueError) as error:
-+                Vector.from_text(f'[1, {token} ]')
-+            assert type(error.value) is ValueError
-+            assert str(error.value) == f'"{token}" is out of range for type vector'
++                SparseVector.from_text(s)
++            assert str(error.value) == 'NaN not allowed in sparsevec'
 +
-+        max_f32 = Vector.from_text('[340282356779733661637539395458142568447]').to_list()[0]
-+        assert max_f32 == 3.4028234663852886e+38
-+        assert Vector.from_text('[3.4028235677973366e+38]').to_list()[0] == 3.4028234663852886e+38
++        for s in ['{1:inf}/3', '{1:+INF}/3', '{1:-Infinity}/3', '{1:infinit}/3']:
++            with pytest.raises(ValueError) as error:
++                SparseVector.from_text(s)
++            assert str(error.value) == 'infinite value not allowed in sparsevec'
 +
-+    def test_from_text_left_to_right(self) -> None:
++    def test_from_text_range_and_float32_rounding(self) -> None:
++        for s, token in [
++            ('{1:1e39}/3', '1e39'),
++            ('{1:1e-50}/3', '1e-50'),
++            ('{1:-1e-50}/3', '-1e-50'),
++            ('{1:+001e39}/3', '+001e39'),
++            ('{1:340282356779733661637539395458142568448}/3', '340282356779733661637539395458142568448'),
++            ('{1:7.00649232162408535461864791644958065640130970938257885878534141944895541342930300743319094181060791015625e-46}/3',
++             '7.00649232162408535461864791644958065640130970938257885878534141944895541342930300743319094181060791015625e-46'),
++            ('{1:1e39, 2:bad}/3', '1e39'),
++            ('{1:1e39x}/3', '1e39'),
++        ]:
++            with pytest.raises(ValueError) as error:
++                SparseVector.from_text(s)
++            assert str(error.value) == f'"{token}" is out of range for type sparsevec'
++
++        vec_max = SparseVector.from_text('{1:340282356779733661637539395458142568447.999999999}/3')
++        assert vec_max.values() == [340282346638528859811704183484516925440.0]
++
++        vec_min_sub = SparseVector.from_text(
++            '{1:7.00649232162408535461864791644958065640130970938257885878534141944895541342930300743319094181060791015625000001e-46}/3'
++        )
++        assert vec_min_sub.values() == [2.0 ** -149]
++
++        vec_no_double_round = SparseVector.from_text('{1:1.0000001788139343261718749999999999}/3')
++        assert vec_no_double_round.values() == [1.0 + 2.0 ** -23]
++
++        vec_tie_even = SparseVector.from_text('{1:1.000000178813934326171875}/3')
++        assert vec_tie_even.values() == [1.0 + 2.0 ** -22]
++
++        vec_tie_even_low = SparseVector.from_text('{1:1.000000059604644775390625}/3')
++        assert vec_tie_even_low.values() == [1.0]
++
++    def test_from_text_bounds_duplicates_and_dimensions(self) -> None:
 +        with pytest.raises(ValueError) as error:
-+            Vector.from_text('[1e39,a]')
-+        assert type(error.value) is ValueError
-+        assert str(error.value) == '"1e39" is out of range for type vector'
++            SparseVector.from_text('{5:1,5:1,10:1}/6')
++        assert str(error.value) == 'sparsevec indices must not contain duplicates'
 +
 +        with pytest.raises(ValueError) as error:
-+            Vector.from_text('[a,1e39]')
-+        assert type(error.value) is ValueError
-+        assert str(error.value) == "could not convert string to float: 'a'"
++            SparseVector.from_text('{0:1,5:1,5:1}/6')
++        assert str(error.value) == 'sparsevec index out of bounds'
 +
-+    def test_from_text_rounding(self) -> None:
-+        assert Vector.from_text('[1.0000000596046448]').to_list() == [1.0000001192092896]
-+        assert Vector.from_text('[1.000000059604644775390625]').to_list() == [1.0]
-+        assert Vector.from_text('[1.000000178813934326171875]').to_list() == [1.000000238418579]
-+        assert Vector.from_text('[7.006492321624086e-46]').to_list() == [1.401298464324817e-45]
-+        assert Vector.from_text('[7.006492321624085e-46]').to_list() == [0.0]
-+        assert Vector.from_text('[1e-100]').to_list() == [0.0]
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{4:1}/3')
++        assert str(error.value) == 'sparsevec index out of bounds'
 +
-+        neg_zero = Vector.from_text('[-1e-100, -0.0, -7.006492321624085e-46]')
-+        assert neg_zero.to_binary() == struct.pack('>hh3f', 3, 0, -0.0, -0.0, -0.0)
-+        assert [math.copysign(1.0, x) for x in neg_zero.to_list()] == [-1.0, -1.0, -1.0]
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{}/-5')
++        assert str(error.value) == 'sparsevec must have at least 1 dimension'
 +
-+    def test_from_text_special_values(self) -> None:
-+        vec = Vector.from_text('[nan, +nan, -NaN, inf, +inf, -inf, infinity, +Infinity, -INFINITY]').to_list()
-+        assert all(math.isnan(x) for x in vec[:3])
-+        assert vec[3:] == [float('inf'), float('inf'), float('-inf'), float('inf'), float('inf'), float('-inf')]
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{}/-2147483649')
++        assert str(error.value) == 'sparsevec must have at least 1 dimension'
 +
-+    def test_from_text_underscores_and_long_digits(self) -> None:
-+        assert Vector.from_text('[1_000.5, -2_0]') == Vector([1000.5, -20.0])
-+        sub_mid = '0.' + '0' * 45 + '700649232162408535461864791644958065640130970938257885878534141944895541342930300743319094181060791015625'
-+        assert Vector.from_text(f'[{sub_mid}]').to_list() == [0.0]
-+        assert Vector.from_text(f'[{sub_mid + "0" * 300 + "1"}]').to_list() == [1.401298464324817e-45]
-+        assert Vector.from_text('[' + '1' + '0' * 5000 + 'e-5000]').to_list() == [1.0]
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{}/1000000001')
++        assert str(error.value) == 'sparsevec cannot have more than 1000000000 dimensions'
 +
-+    def test_from_db_unchanged(self) -> None:
-+        assert Vector._from_db('[1, 1e39]') == [1.0, 1e39]
-+        assert Vector._from_db('[1.0000000596046448]') == [1.0000000596046448]
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{}/2147483648')
++        assert str(error.value) == 'sparsevec cannot have more than 1000000000 dimensions'
++
++        vec_max_dim = SparseVector.from_text('{1000000000:1}/1000000000')
++        assert vec_max_dim.dimensions() == 1000000000
++        assert vec_max_dim.indices() == [999999999]
++        assert vec_max_dim.values() == [1.0]
++
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{2147483648:1}/1000000000')
++        assert str(error.value) == 'sparsevec index out of bounds'
++
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text('{-2147483648:1}/3')
++        assert str(error.value) == 'sparsevec index out of bounds'
++
++    def test_from_text_max_elements_and_huge_tokens(self) -> None:
++        ok = '{' + ','.join(f'{i}:1' for i in range(1, 16001)) + '}/16000'
++        vec = SparseVector.from_text(ok)
++        assert vec.dimensions() == 16000
++        assert len(vec.indices()) == 16000
++
++        too_many = '{' + ','.join(f'{i}:0' for i in range(1, 16002)) + '}/16001'
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text(too_many)
++        assert str(error.value) == 'sparsevec cannot have more than 16000 non-zero elements'
++
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text(',' * 16000)
++        assert str(error.value) == 'sparsevec cannot have more than 16000 non-zero elements'
++
++        huge_zero_idx = '0' * 999999 + '1'
++        huge_zero_frac = '0.' + '0' * 999995 + '1'
++        with pytest.raises(ValueError) as error:
++            SparseVector.from_text(f'{{{huge_zero_idx}:{huge_zero_frac}}}/1')
++        assert str(error.value) == f'"{huge_zero_frac}" is out of range for type sparsevec'
++
++        huge_exact_one = '1' + '0' * 999999 + 'e-999999'
++        vec_huge = SparseVector.from_text(f'{{{huge_zero_idx}:{huge_exact_one}}}/{"0" * 999999 + "1"}')
++        assert vec_huge.dimensions() == 1
++        assert vec_huge.indices() == [0]
++        assert vec_huge.values() == [1.0]
++
++        huge_sticky_sub = '7.00649232162408535461864791644958065640130970938257885878534141944895541342930300743319094181060791015625' + '0' * 999000 + '1e-46'
++        vec_sticky = SparseVector.from_text(f'{{1:{huge_sticky_sub}}}/1')
++        assert vec_sticky.values() == [2.0 ** -149]
++
++        assert SparseVector._from_db('{3:2, 1:1.5}/6') == SparseVector([1.5, 0, 2, 0, 0, 0])
+ 
+     # TODO uncomment in 0.6.0
+     # def test_from_text_unsorted(self) -> None:
