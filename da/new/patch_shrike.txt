@@ -1,288 +1,471 @@
-diff --git a/pgvector/sparsevec.py b/pgvector/sparsevec.py
-index 76e1356..66aef88 100644
---- a/pgvector/sparsevec.py
-+++ b/pgvector/sparsevec.py
-@@ -1,5 +1,7 @@
- from __future__ import annotations
- from struct import pack, unpack_from
-+import math
-+import re
- from typing import TYPE_CHECKING, Final, cast, overload
- from ._utils import is_sparse_array, ndarray
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f033cf1..b2e3e19 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,10 @@
+ - Fixed memory leak with `register_vector` and `register_vector_async` for Psycopg 3
+ - Fixed error with `Bit` constructor and empty strings
+ - Fixed equality for `HalfVector` with signed zeros
++- Fixed binary format for `Vector` and `HalfVector` with more than 32767 dimensions
++- Fixed precision of `SparseVector` values with binary format
++- Fixed `Bit.from_binary` with non-zero padding bits
++- Added `ValueError` for NaN values and values that cannot be represented in binary format
  
-@@ -15,6 +17,106 @@ class Sentinel:
- NO_DEFAULT: Final[Sentinel] = Sentinel()
+ ## 0.5.1 (2026-10-08)
  
+diff --git a/pgvector/bit.py b/pgvector/bit.py
+index a9370e4..7b170cc 100644
+--- a/pgvector/bit.py
++++ b/pgvector/bit.py
+@@ -55,6 +55,10 @@ class Bit:
+         else:
+             raise ValueError('expected bytes, str, list, or ndarray')
  
-+_SPARSEVEC_MAX_NNZ: Final = 16000
-+_SPARSEVEC_MAX_DIM: Final = 1000000000
-+_WHITESPACE: Final = ' \t\n\r\v\f'
-+_INTEGER_RE: Final = re.compile(r'[+-]?[0-9]+')
-+_VALUE_RE: Final = re.compile(
-+    r'[+-]?(?:'
-+    r'(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?'
-+    r'|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?'
-+    r'|[nN][aA][nN]'
-+    r')'
-+)
-+# halfway points between float32 values have at most 112 significant digits
-+_MAX_SIGNIFICANT_DIGITS: Final = 200
++        # limited by the binary format
++        if self._length > 2**31 - 1:
++            raise ValueError('bit string too long')
 +
-+
-+def _parse_clamped_int(token: str, lo: int, hi: int) -> int:
-+    negative = token[0] == '-'
-+    digits = token.lstrip('+-').lstrip('0')
-+    if len(digits) > 12:
-+        return lo if negative else hi
-+    v = int(digits or '0')
-+    if negative:
-+        v = -v
-+    return max(lo, min(hi, v))
-+
-+
-+def _round_float32(num: int, den: int) -> tuple[int, int]:
-+    e = max(num.bit_length() - den.bit_length() - 24, -149)
-+    while True:
-+        if e >= 0:
-+            d = den << e
-+            q, r = divmod(num, d)
-+        else:
-+            d = den
-+            q, r = divmod(num << -e, d)
-+        if q >= 1 << 24:
-+            e += 1
-+            continue
-+        break
-+    if 2 * r > d or (2 * r == d and q & 1):
-+        q += 1
-+        if q == 1 << 24:
-+            q >>= 1
-+            e += 1
-+    return q, e
-+
-+
-+def _parse_float32(token: str) -> float:
-+    body = token.lstrip('+-')
-+    negative = token[0] == '-'
-+    lower = body[:8].lower()
-+    if lower == 'nan':
-+        raise ValueError('NaN not allowed in sparsevec')
-+    if lower in ('inf', 'infinity'):
-+        raise ValueError('infinite value not allowed in sparsevec')
-+
-+    exp_pos = max(body.find('e'), body.find('E'))
-+    if exp_pos >= 0:
-+        mantissa = body[:exp_pos]
-+        exp_token = body[exp_pos + 1:]
-+        exp_negative = exp_token[0] == '-'
-+        exp_digits = exp_token.lstrip('+-').lstrip('0')
-+        exp10 = 10 ** 10 if len(exp_digits) > 10 else int(exp_digits or '0')
-+        if exp_negative:
-+            exp10 = -exp10
-+    else:
-+        mantissa = body
-+        exp10 = 0
-+
-+    int_part, _, frac_part = mantissa.partition('.')
-+    digits = (int_part + frac_part).lstrip('0')
-+    exp10 -= len(frac_part)
-+    stripped = digits.rstrip('0')
-+    exp10 += len(digits) - len(stripped)
-+    digits = stripped
-+    if not digits:
-+        return 0.0
-+
-+    if len(digits) > _MAX_SIGNIFICANT_DIGITS:
-+        exp10 += len(digits) - _MAX_SIGNIFICANT_DIGITS - 1
-+        digits = digits[:_MAX_SIGNIFICANT_DIGITS] + '1'
-+
-+    out_of_range = f'"{token}" is out of range for type sparsevec'
-+    magnitude = exp10 + len(digits) - 1
-+    if magnitude > 39 or magnitude < -47:
-+        raise ValueError(out_of_range)
-+
-+    n = int(digits)
-+    if exp10 >= 0:
-+        q, e = _round_float32(n * 10 ** exp10, 1)
-+    else:
-+        q, e = _round_float32(n, 10 ** -exp10)
-+
-+    if q == 0 or e > 104:
-+        raise ValueError(out_of_range)
-+
-+    v = math.ldexp(q, e)
-+    return -v if negative else v
-+
-+
- class SparseVector:
-     _dim: int
-     _indices: list[int]
-@@ -159,16 +261,85 @@ class SparseVector:
+     def __repr__(self) -> str:
+         return f'Bit({self.to_text()})'
+ 
+@@ -85,12 +89,17 @@ class Bit:
  
      @classmethod
-     def from_text(cls, value: str, /) -> SparseVector:
--        elements, dim = value.split('/', 2)
--        indices: list[int] = []
--        values: list[float] = []
--        # split on empty string returns single element list
--        if len(elements) > 2:
--            for e in elements[1:-1].split(','):
--                i, v = e.split(':', 2)
--                indices.append(int(i) - 1)
--                values.append(float(v))
--        return cls._from_parts(int(dim), indices, values)
-+        syntax_error = f'invalid input syntax for type sparsevec: "{value}"'
+     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> Bit:
++        value = memoryview(value).cast('B')
+         length, = unpack_from('>i', value)
+-        data = memoryview(value)[4:].tobytes()
++        data = value[4:].tobytes()
+ 
+         if length < 0 or len(data) != (length + 7) // 8:
+             raise ValueError('invalid length')
+ 
++        # clear padding bits so value matches text format
++        if length % 8 != 0:
++            data = data[:-1] + bytes([data[-1] & (0xff << (8 - length % 8)) & 0xff])
 +
-+        if value.count(',') + 1 > _SPARSEVEC_MAX_NNZ:
-+            raise ValueError(f'sparsevec cannot have more than {_SPARSEVEC_MAX_NNZ} non-zero elements')
+         bit = cls.__new__(cls)
+         bit._length = length
+         bit._data = data
+diff --git a/pgvector/halfvec.py b/pgvector/halfvec.py
+index 2b3b325..1efa27d 100644
+--- a/pgvector/halfvec.py
++++ b/pgvector/halfvec.py
+@@ -9,6 +9,10 @@ if TYPE_CHECKING:
+     import numpy as np
+ 
+ 
++# limited by the binary format
++MAX_DIM = 65535
 +
-+        n = len(value)
 +
-+        def skip(pos: int) -> int:
-+            while pos < n and value[pos] in _WHITESPACE:
-+                pos += 1
-+            return pos
+ class HalfVector:
+     _value: array[int]  # uses uint16 since no float16
+ 
+@@ -17,7 +21,7 @@ class HalfVector:
+             dim = len(value)
+             try:
+                 self._value = array('H', struct.pack(f'{dim}e', *value))
+-            except struct.error:
++            except (struct.error, OverflowError):
+                 raise ValueError('expected list[float]')
+         elif is_ndarray(value):
+             import numpy as np
+@@ -31,6 +35,8 @@ class HalfVector:
+         else:
+             raise ValueError('expected list or ndarray')
+ 
++        self._validate()
 +
-+        pos = skip(0)
-+        if pos >= n or value[pos] != '{':
-+            raise ValueError(syntax_error)
-+        pos = skip(pos + 1)
+     def __repr__(self) -> str:
+         return f'HalfVector({self.to_list()})'
+ 
+@@ -68,8 +74,10 @@ class HalfVector:
+ 
+     @classmethod
+     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> HalfVector:
+-        dim, unused = struct.unpack_from('>hh', value)
+-        data = memoryview(value)[4:]
++        value = memoryview(value).cast('B')
++        # unsigned to match to_binary
++        dim, unused = struct.unpack_from('>HH', value)
++        data = value[4:]
+ 
+         if len(data) != 2 * dim:
+             raise ValueError('invalid length')
+@@ -84,8 +92,17 @@ class HalfVector:
+ 
+         vec = cls.__new__(cls)
+         vec._value = arr
++        vec._validate()
+         return vec
+ 
++    def _validate(self) -> None:
++        if len(self._value) > MAX_DIM:
++            raise ValueError(f'halfvec cannot have more than {MAX_DIM} dimensions')
 +
-+        elements: list[tuple[int, float]] = []
-+        if pos < n and value[pos] == '}':
-+            pos += 1
-+        else:
-+            while True:
-+                pos = skip(pos)
-+                m = _INTEGER_RE.match(value, pos)
-+                if m is None:
-+                    raise ValueError(syntax_error)
-+                index_token = m.group()
-+                pos = skip(m.end())
-+                if pos >= n or value[pos] != ':':
-+                    raise ValueError(syntax_error)
-+                pos = skip(pos + 1)
++        # exponent all ones and non-zero mantissa
++        if any((v & 0x7fff) > 0x7c00 for v in self._value):
++            raise ValueError('NaN not allowed in halfvec')
 +
-+                m = _VALUE_RE.match(value, pos)
-+                if m is None:
-+                    raise ValueError(syntax_error)
-+                token = m.group()
-+                pos = m.end()
+     @classmethod
+     def _from_text(cls, value: str, /) -> list[float]:
+         if len(value) == 2:
+diff --git a/pgvector/sparsevec.py b/pgvector/sparsevec.py
+index 76e1356..a50371c 100644
+--- a/pgvector/sparsevec.py
++++ b/pgvector/sparsevec.py
+@@ -1,4 +1,6 @@
+ from __future__ import annotations
++from array import array
++import math
+ from struct import pack, unpack_from
+ from typing import TYPE_CHECKING, Final, cast, overload
+ from ._utils import is_sparse_array, ndarray
+@@ -14,6 +16,18 @@ class Sentinel:
+ 
+ NO_DEFAULT: Final[Sentinel] = Sentinel()
+ 
++# limited by the binary format
++INT32_MIN: Final = -2**31
++INT32_MAX: Final = 2**31 - 1
 +
-+                v = _parse_float32(token)
-+                if v != 0:
-+                    index = _parse_clamped_int(index_token, -2147483647, 2147483647)
-+                    elements.append((index - 1, v))
 +
-+                pos = skip(pos)
-+                if pos < n and value[pos] == ',':
-+                    pos += 1
-+                elif pos < n and value[pos] == '}':
-+                    pos += 1
-+                    break
-+                else:
-+                    raise ValueError(syntax_error)
++def to_float32(values: list[float], /) -> list[float]:
++    # same conversion as Vector
++    try:
++        return array('f', values).tolist()
++    except OverflowError:
++        raise ValueError('expected list[float]')
 +
-+        pos = skip(pos)
-+        if pos >= n or value[pos] != '/':
-+            raise ValueError(syntax_error)
-+        pos = skip(pos + 1)
-+        m = _INTEGER_RE.match(value, pos)
-+        if m is None:
-+            raise ValueError(syntax_error)
-+        dim = _parse_clamped_int(m.group(), -2147483648, 2147483647)
-+        pos = skip(m.end())
-+        if pos != n:
-+            raise ValueError(syntax_error)
+ 
+ class SparseVector:
+     _dim: int
+@@ -99,8 +113,7 @@ class SparseVector:
+         elements.sort()
+ 
+         self._dim = int(dim)
+-        self._indices = [int(v[0]) for v in elements]
+-        self._values = [float(v[1]) for v in elements]
++        self._set_elements([int(v[0]) for v in elements], [float(v[1]) for v in elements])
+         # TODO uncomment in 0.6.0
+         # self._validate()
+ 
+@@ -132,18 +145,36 @@ class SparseVector:
+         if not hasattr(value, 'has_canonical_format') or not value.has_canonical_format:
+             elements.sort()
+ 
+-        self._indices = [v[0] for v in elements]
+-        self._values = [float(v[1]) for v in elements]
++        self._set_elements([v[0] for v in elements], [float(v[1]) for v in elements])
+ 
+     def _from_dense(self, value: list[float] | ndarray, /) -> None:
+         self._dim = len(value)
+-        self._indices = []
+-        self._values = []
++        indices: list[int] = []
++        values: list[float] = []
+         for i, v in enumerate(value):
+             v = float(v)
+             if v != 0:
+-                self._indices.append(i)
+-                self._values.append(v)
++                indices.append(i)
++                values.append(v)
++        self._set_elements(indices, values)
 +
-+        if dim < 1:
-+            raise ValueError('sparsevec must have at least 1 dimension')
-+        if dim > _SPARSEVEC_MAX_DIM:
-+            raise ValueError(f'sparsevec cannot have more than {_SPARSEVEC_MAX_DIM} dimensions')
++    def _set_elements(self, indices: list[int], values: list[float], /) -> None:
++        # values may become zero after conversion to float32
++        values = to_float32(values)
++        elements = [(i, v) for i, v in zip(indices, values) if v != 0]
++        self._indices = [v[0] for v in elements]
++        self._values = [v[1] for v in elements]
++        self._validate_binary()
 +
-+        elements.sort(key=lambda e: e[0])
-+        prev: int | None = None
-+        for index, _ in elements:
-+            if index < 0 or index >= dim:
-+                raise ValueError('sparsevec index out of bounds')
-+            if index == prev:
-+                raise ValueError('sparsevec indices must not contain duplicates')
-+            prev = index
++    def _validate_binary(self) -> None:
++        if self._dim < INT32_MIN or self._dim > INT32_MAX:
++            raise ValueError('sparsevec dimensions out of range')
 +
-+        return cls._from_parts(dim, [e[0] for e in elements], [e[1] for e in elements])
++        if any(i < INT32_MIN or i > INT32_MAX for i in self._indices):
++            raise ValueError('sparsevec index out of range')
++
++        if any(map(math.isnan, self._values)):
++            raise ValueError('NaN not allowed in sparsevec')
+ 
+     def _validate(self) -> None:
+         if self._dim < 0:
+@@ -172,6 +203,7 @@ class SparseVector:
  
      @classmethod
      def from_binary(cls, value: bytes | bytearray | memoryview, /) -> SparseVector:
++        value = memoryview(value).cast('B')
+         dim, nnz, unused = unpack_from('>iii', value)
+ 
+         if len(value) != 12 + 8 * nnz:
+@@ -189,7 +221,8 @@ class SparseVector:
+         vec = cls.__new__(cls)
+         vec._dim = dim
+         vec._indices = indices
+-        vec._values = values
++        vec._values = to_float32(values)
++        vec._validate_binary()
+         # TODO uncomment in 0.6.0
+         # vec._validate()
+         # vec._validate_sorted()
+diff --git a/pgvector/vector.py b/pgvector/vector.py
+index d86cba0..98be445 100644
+--- a/pgvector/vector.py
++++ b/pgvector/vector.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ from array import array
++import math
+ import struct
+ import sys
+ from typing import TYPE_CHECKING
+@@ -9,6 +10,10 @@ if TYPE_CHECKING:
+     import numpy as np
+ 
+ 
++# limited by the binary format
++MAX_DIM = 65535
++
++
+ class Vector:
+     _value: array[float]
+ 
+@@ -16,7 +21,7 @@ class Vector:
+         if isinstance(value, list):
+             try:
+                 self._value = array('f', value)
+-            except TypeError:
++            except (TypeError, OverflowError):
+                 raise ValueError('expected list[float]')
+         elif is_ndarray(value):
+             import numpy as np
+@@ -30,6 +35,8 @@ class Vector:
+         else:
+             raise ValueError('expected list or ndarray')
+ 
++        self._validate()
++
+     def __repr__(self) -> str:
+         return f'Vector({self.to_list()})'
+ 
+@@ -66,8 +73,10 @@ class Vector:
+ 
+     @classmethod
+     def from_binary(cls, value: bytes | bytearray | memoryview, /) -> Vector:
+-        dim, unused = struct.unpack_from('>hh', value)
+-        data = memoryview(value)[4:]
++        value = memoryview(value).cast('B')
++        # unsigned to match to_binary
++        dim, unused = struct.unpack_from('>HH', value)
++        data = value[4:]
+ 
+         if len(data) != 4 * dim:
+             raise ValueError('invalid length')
+@@ -82,8 +91,16 @@ class Vector:
+ 
+         vec = cls.__new__(cls)
+         vec._value = arr
++        vec._validate()
+         return vec
+ 
++    def _validate(self) -> None:
++        if len(self._value) > MAX_DIM:
++            raise ValueError(f'vector cannot have more than {MAX_DIM} dimensions')
++
++        if any(map(math.isnan, self._value)):
++            raise ValueError('NaN not allowed in vector')
++
+     @classmethod
+     def _from_text(cls, value: str, /) -> list[float]:
+         if len(value) == 2:
+diff --git a/tests/test_bit.py b/tests/test_bit.py
+index 9179cd3..3d2f998 100644
+--- a/tests/test_bit.py
++++ b/tests/test_bit.py
+@@ -142,3 +142,16 @@ class TestBit:
+     def test_from_binary_negative_length(self) -> None:
+         with pytest.raises(ValueError, match='invalid length'):
+             Bit.from_binary(struct.pack('>i', -1))
++
++    def test_from_binary_padding(self) -> None:
++        bit = Bit.from_binary(struct.pack('>iB', 3, 0xff))
++        assert bit == Bit('111')
++        assert bit.to_binary() == Bit('111').to_binary()
++        assert Bit.from_text(bit.to_text()) == bit
++        assert Bit.from_binary(bit.to_binary()) == bit
++
++    def test_round_trip(self) -> None:
++        for value in ['', '1', '10101', '11111111', '111111111']:
++            bit = Bit(value)
++            assert Bit.from_text(bit.to_text()) == bit
++            assert Bit.from_binary(bit.to_binary()) == bit
+diff --git a/tests/test_half_vector.py b/tests/test_half_vector.py
+index a907c94..b83eced 100644
+--- a/tests/test_half_vector.py
++++ b/tests/test_half_vector.py
+@@ -136,3 +136,40 @@ class TestHalfVector:
+     def test_from_binary_non_zero_unused(self) -> None:
+         with pytest.raises(ValueError, match='expected unused to be 0'):
+             HalfVector.from_binary(struct.pack('>hh', 0, 1))
++
++    def test_round_trip(self) -> None:
++        vec = HalfVector([0.1, -0.0, float('inf'), float('-inf'), 6e-08, 65504])
++        assert HalfVector.from_text(vec.to_text()) == vec
++        assert HalfVector.from_binary(vec.to_binary()) == vec
++
++    def test_round_trip_large_dimensions(self) -> None:
++        vec = HalfVector([1.0] * 65535)
++        assert HalfVector.from_text(vec.to_text()) == vec
++        assert HalfVector.from_binary(vec.to_binary()) == vec
++
++    def test_init_too_many_dimensions(self) -> None:
++        with pytest.raises(ValueError, match='halfvec cannot have more than 65535 dimensions'):
++            HalfVector([1.0] * [REDACTED])
++
++    def test_init_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in halfvec'):
++            HalfVector([float('nan')])
++
++    def test_init_ndarray_nan(self) -> None:
++        if np is None:
++            pytest.skip('NumPy required')
++
++        with pytest.raises(ValueError, match='NaN not allowed in halfvec'):
++            HalfVector(np.array([np.nan]))
++
++    def test_init_overflow(self) -> None:
++        with pytest.raises(ValueError, match='expected list\\[float\\]'):
++            HalfVector([1e5])
++
++    def test_from_text_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in halfvec'):
++            HalfVector.from_text('[nan]')
++
++    def test_from_binary_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in halfvec'):
++            HalfVector.from_binary(struct.pack('>hhH', 1, 0, 0x7c01))
 diff --git a/tests/test_sparse_vector.py b/tests/test_sparse_vector.py
-index e3bb8cc..fe280c5 100644
+index e3bb8cc..2cd548a 100644
 --- a/tests/test_sparse_vector.py
 +++ b/tests/test_sparse_vector.py
-@@ -176,19 +176,62 @@ class TestSparseVector:
-         assert SparseVector.from_text('{1:1.5,3:2,5:3}/6') == SparseVector([1.5, 0, 2, 0, 3, 0])
- 
-     def test_from_text_zero_length(self) -> None:
--        with pytest.raises(ValueError, match='not enough values to unpack'):
-+        with pytest.raises(ValueError) as error:
-             SparseVector.from_text('')
-+        assert str(error.value) == 'invalid input syntax for type sparsevec: ""'
- 
-     def test_from_text_zero_dimensions(self) -> None:
--        assert SparseVector.from_text('{}/0') == SparseVector([])
-+        with pytest.raises(ValueError) as error:
-+            SparseVector.from_text('{}/0')
-+        assert str(error.value) == 'sparsevec must have at least 1 dimension'
- 
-     def test_from_text_non_number_index(self) -> None:
--        with pytest.raises(ValueError, match='invalid literal for int'):
--            assert SparseVector.from_text('{a:1}/1')
-+        with pytest.raises(ValueError) as error:
-+            SparseVector.from_text('{a:1}/1')
-+        assert str(error.value) == 'invalid input syntax for type sparsevec: "{a:1}/1"'
- 
-     def test_from_text_non_number_value(self) -> None:
--        with pytest.raises(ValueError, match='could not convert string to float'):
--            assert SparseVector.from_text('{1:a}/1')
-+        with pytest.raises(ValueError) as error:
-+            SparseVector.from_text('{1:a}/1')
-+        assert str(error.value) == 'invalid input syntax for type sparsevec: "{1:a}/1"'
+@@ -224,3 +224,67 @@ class TestSparseVector:
+     def test_from_binary_non_zero_unused(self) -> None:
+         with pytest.raises(ValueError, match='expected unused to be 0'):
+             SparseVector.from_binary(struct.pack('>iii', 0, 0, 1))
 +
-+    def test_from_text_whitespace(self) -> None:
-+        vec = SparseVector.from_text(' { 3 : 2 ,\t1:1.5 } / 6 ')
-+        assert vec.dimensions() == 6
-+        assert vec.indices() == [0, 2]
-+        assert vec.values() == [1.5, 2.0]
++    def test_round_trip(self) -> None:
++        vec = SparseVector({0: 0.1, 2: float('inf'), 3: -1e-45, 4: 1e-50}, 5)
++        assert vec.indices() == [0, 2, 3]
++        assert SparseVector.from_text(vec.to_text()) == vec
++        assert SparseVector.from_binary(vec.to_binary()) == vec
 +
-+    def test_from_text_zero_values(self) -> None:
-+        vec = SparseVector.from_text('{1:0,9:0}/3')
-+        assert vec.dimensions() == 3
-+        assert vec.indices() == []
++    def test_round_trip_list(self) -> None:
++        vec = SparseVector([0.1, 0, 0.2])
++        assert SparseVector.from_text(vec.to_text()) == vec
++        assert SparseVector.from_binary(vec.to_binary()) == vec
 +
-+    @pytest.mark.parametrize('text,message', [
-+        ('{5:1,5:1,10:1}/6', 'sparsevec indices must not contain duplicates'),
-+        ('{4:1}/3', 'sparsevec index out of bounds'),
-+        ('{0:1}/3', 'sparsevec index out of bounds'),
-+        ('{1:1e39}/3', '"1e39" is out of range for type sparsevec'),
-+        ('{1:1e-50}/3', '"1e-50" is out of range for type sparsevec'),
-+        ('{1:nan}/3', 'NaN not allowed in sparsevec'),
-+        ('{1:-Infinity}/3', 'infinite value not allowed in sparsevec'),
-+        ('{1:1.5x}/3', 'invalid input syntax for type sparsevec: "{1:1.5x}/3"'),
-+        ('{1:1e+x}/3', 'invalid input syntax for type sparsevec: "{1:1e+x}/3"'),
-+        ('{}/1000000001', 'sparsevec cannot have more than 1000000000 dimensions'),
-+        ('{' + ',' * 16000 + '}/1', 'sparsevec cannot have more than 16000 non-zero elements'),
-+    ])
-+    def test_from_text_errors(self, text: str, message: str) -> None:
-+        with pytest.raises(ValueError) as error:
-+            SparseVector.from_text(text)
-+        assert type(error.value) is ValueError
-+        assert str(error.value) == message
++    def test_round_trip_ndarray(self) -> None:
++        if np is None:
++            pytest.skip('NumPy required')
 +
-+    def test_from_text_float32_rounding(self) -> None:
-+        assert SparseVector.from_text('{1:0.1}/1').values() == [struct.unpack('f', struct.pack('f', 0.1))[0]]
-+        # halfway between 1 and the next float32, plus a tiny bit past double precision
-+        assert SparseVector.from_text('{1:1.000000059604644775390625000000000001}/1').values() == [1.0000001192092896]
-+        assert SparseVector.from_text('{1:1.000000059604644775390625}/1').values() == [1.0]
-+        assert SparseVector.from_text('{1:' + '0' * 1000000 + '1.5}/1').values() == [1.5]
-+        assert SparseVector.from_text('{1:1e-45}/1').values() == [2.0 ** -149]
- 
-     # TODO uncomment in 0.6.0
-     # def test_from_text_unsorted(self) -> None:
++        vec = SparseVector(np.array([0.1, 0, 0.2]))
++        assert SparseVector.from_text(vec.to_text()) == vec
++        assert SparseVector.from_binary(vec.to_binary()) == vec
++
++    def test_round_trip_coo_array(self) -> None:
++        if np is None or sparse is None:
++            pytest.skip('NumPy and SciPy required')
++
++        vec = SparseVector(sparse.coo_array(np.array([0.1, 0, 0.2])))
++        assert SparseVector.from_text(vec.to_text()) == vec
++        assert SparseVector.from_binary(vec.to_binary()) == vec
++
++    def test_round_trip_from_text(self) -> None:
++        vec = SparseVector.from_text('{1:0.1,3:0.2}/3')
++        assert SparseVector.from_text(vec.to_text()) == vec
++        assert SparseVector.from_binary(vec.to_binary()) == vec
++
++    def test_init_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in sparsevec'):
++            SparseVector([float('nan')])
++
++    def test_init_dict_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in sparsevec'):
++            SparseVector({0: float('nan')}, 1)
++
++    def test_init_dict_dimensions_out_of_range(self) -> None:
++        with pytest.raises(ValueError, match='sparsevec dimensions out of range'):
++            SparseVector({}, 2**31)
++
++    def test_init_dict_index_out_of_range(self) -> None:
++        with pytest.raises(ValueError, match='sparsevec index out of range'):
++            SparseVector({2**31: 1}, 1)
++
++    def test_from_text_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in sparsevec'):
++            SparseVector.from_text('{1:nan}/1')
++
++    def test_from_text_dimensions_out_of_range(self) -> None:
++        with pytest.raises(ValueError, match='sparsevec dimensions out of range'):
++            SparseVector.from_text('{}/2147483648')
++
++    def test_from_text_index_out_of_range(self) -> None:
++        with pytest.raises(ValueError, match='sparsevec index out of range'):
++            SparseVector.from_text('{2147483649:1}/1')
++
++    def test_from_binary_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in sparsevec'):
++            SparseVector.from_binary(struct.pack('>iiiiI', 1, 1, 0, 0, 0x7fc00000))
+diff --git a/tests/test_vector.py b/tests/test_vector.py
+index 13a9cc7..5ef4aa4 100644
+--- a/tests/test_vector.py
++++ b/tests/test_vector.py
+@@ -136,3 +136,44 @@ class TestVector:
+     def test_from_binary_non_zero_unused(self) -> None:
+         with pytest.raises(ValueError, match='expected unused to be 0'):
+             Vector.from_binary(struct.pack('>hh', 0, 1))
++
++    def test_round_trip(self) -> None:
++        vec = Vector([0.1, -0.0, float('inf'), float('-inf'), 1e-45, 3.4028234663852886e+38])
++        assert Vector.from_text(vec.to_text()) == vec
++        assert Vector.from_binary(vec.to_binary()) == vec
++
++    def test_round_trip_large_dimensions(self) -> None:
++        vec = Vector([1.0] * 65535)
++        assert Vector.from_text(vec.to_text()) == vec
++        assert Vector.from_binary(vec.to_binary()) == vec
++
++    def test_init_too_many_dimensions(self) -> None:
++        with pytest.raises(ValueError, match='vector cannot have more than 65535 dimensions'):
++            Vector([1.0] * [REDACTED])
++
++    def test_init_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in vector'):
++            Vector([float('nan')])
++
++    def test_init_ndarray_nan(self) -> None:
++        if np is None:
++            pytest.skip('NumPy required')
++
++        with pytest.raises(ValueError, match='NaN not allowed in vector'):
++            Vector(np.array([np.nan]))
++
++    def test_init_int_overflow(self) -> None:
++        with pytest.raises(ValueError, match='expected list\\[float\\]'):
++            Vector([10**400])
++
++    def test_from_text_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in vector'):
++            Vector.from_text('[nan]')
++
++    def test_from_binary_nan(self) -> None:
++        with pytest.raises(ValueError, match='NaN not allowed in vector'):
++            Vector.from_binary(struct.pack('>hhI', 1, 0, 0x7fc00001))
++
++    def test_from_binary_memoryview(self) -> None:
++        data = memoryview(struct.pack('>hh2f', 2, 0, 1.5, 2)).cast('I')
++        assert Vector.from_binary(data) == Vector([1.5, 2])
